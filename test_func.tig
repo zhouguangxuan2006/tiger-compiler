@@ -1,0 +1,6 @@
+let
+  function skipto() =
+    let var x := 5 in x end
+in
+  skipto()
+end
