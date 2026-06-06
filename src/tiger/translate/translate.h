@@ -18,7 +18,7 @@ class Level;
 
 class PatchList {
 public:
-  void DoPatch(temp::Label *label) {
+  void DoPatch(temp::Label *label) const{
     for(auto &patch : patch_list_) *patch = label;
   }
 
@@ -70,7 +70,7 @@ public:
   static Level *NewLevel(Level *parent, temp::Label *name,
                          std::list<bool> formals) {
     // Create new frame and manage static link by insert a TRUE into boollist
-    formals.push_back(true);
+    formals.push_front(true);
     return new Level(frame::NewFrame(name, formals), parent);
   }
 };

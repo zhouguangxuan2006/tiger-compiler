@@ -1,0 +1,2621 @@
+diff --git a/src/tiger/codegen/codegen.cc b/src/tiger/codegen/codegen.cc
+index a75019c..319eeac 100644
+--- a/src/tiger/codegen/codegen.cc
++++ b/src/tiger/codegen/codegen.cc
+@@ -1,23 +1,113 @@
+ #include "tiger/codegen/codegen.h"
+ 
++#include <algorithm>
+ #include <cassert>
+ #include <sstream>
++#include <string>
++#include <vector>
+ 
+ extern frame::RegManager *reg_manager;
+ 
+ namespace {
+ 
+ constexpr int maxlen = 1024;
++frame::Frame *current_frame = nullptr;
+ 
++temp::TempList *TL() { return new temp::TempList(); }
++
++temp::TempList *TL(temp::Temp *a) { return new temp::TempList({a}); }
++
++temp::TempList *TL(temp::Temp *a, temp::Temp *b) {
++  return new temp::TempList({a, b});
++}
++
++temp::TempList *TL(temp::Temp *a, temp::Temp *b, temp::Temp *c) {
++  return new temp::TempList({a, b, c});
++}
++
++bool IsFramePointer(tree::Exp *exp) {
++  auto temp_exp = dynamic_cast<tree::TempExp *>(exp);
++  return temp_exp && temp_exp->temp_ == reg_manager->FramePointer();
++}
++
++bool IsConst(tree::Exp *exp, int *value) {
++  auto const_exp = dynamic_cast<tree::ConstExp *>(exp);
++  if (!const_exp)
++    return false;
++  *value = const_exp->consti_;
++  return true;
++}
++
++std::string FrameOffset(int offset, std::string_view fs) {
++  std::ostringstream out;
++  if (offset == 0)
++    out << fs;
++  else if (offset > 0)
++    out << offset << "+" << fs;
++  else
++    out << fs << offset;
++  out << "(%rsp)";
++  return out.str();
++}
++
++struct MemOperand {
++  std::string assem_;
++  temp::TempList *src_;
++};
++
++MemOperand MunchMemOperand(tree::Exp *exp, assem::InstrList &instr_list,
++                           std::string_view fs) {
++  if (IsFramePointer(exp))
++    return {FrameOffset(0, fs), TL()};
++
++  if (auto binop = dynamic_cast<tree::BinopExp *>(exp);
++      binop && binop->op_ == tree::PLUS_OP) {
++    int offset = 0;
++    if (IsFramePointer(binop->left_) && IsConst(binop->right_, &offset))
++      return {FrameOffset(offset, fs), TL()};
++    if (IsFramePointer(binop->right_) && IsConst(binop->left_, &offset))
++      return {FrameOffset(offset, fs), TL()};
++  }
++
++  temp::Temp *addr = exp->Munch(instr_list, fs);
++  return {"(`s0)", TL(addr)};
++}
++
++std::string RelopAssem(tree::RelOp op) {
++  switch (op) {
++  case tree::EQ_OP:
++    return "je";
++  case tree::NE_OP:
++    return "jne";
++  case tree::LT_OP:
++  case tree::ULT_OP:
++    return "jl";
++  case tree::GT_OP:
++  case tree::UGT_OP:
++    return "jg";
++  case tree::LE_OP:
++  case tree::ULE_OP:
++    return "jle";
++  case tree::GE_OP:
++  case tree::UGE_OP:
++    return "jge";
++  default:
++    assert(false);
++  }
++}
+ 
+ } // namespace
+ 
+ namespace cg {
+ 
+ void CodeGen::Codegen() {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  fs_ = frame_->GetLabel() + "_framesize";
++  current_frame = frame_;
++  auto *instr_list = new assem::InstrList();
++  for (auto stm : traces_->GetStmList()->GetList())
++    stm->Munch(*instr_list, fs_);
++  current_frame = nullptr;
++  assem_instr_ = std::make_unique<AssemInstr>(instr_list);
+ }
+ 
+ void AssemInstr::Print(FILE *out, temp::Map *map) const {
+@@ -29,7 +119,6 @@ void AssemInstr::Print(FILE *out, temp::Map *map) const {
+ 
+ namespace tree {
+ 
+-/* TODO: Put your lab5 code here */
+ /**
+  * Generate code for passing arguments
+  * @param args argument list
+@@ -37,88 +126,196 @@ namespace tree {
+  * @return temp list to hold arguments
+  */
+ temp::TempList *ExpList::MunchArgs(assem::InstrList &instr_list, std::string_view fs) {
+-  
+-  /* End for lab5 code */
++  std::vector<temp::Temp *> arg_values;
++  auto iter = exp_list_.begin();
++  if (iter != exp_list_.end()) {
++    auto magic_name = dynamic_cast<tree::NameExp *>(*iter);
++    if (magic_name &&
++        temp::LabelFactory::LabelString(magic_name->name_) == "staticLink")
++      ++iter;
++  }
++
++  for (; iter != exp_list_.end(); ++iter)
++    arg_values.push_back((*iter)->Munch(instr_list, fs));
++
++  temp::TempList *arg_regs = reg_manager->ArgRegs();
++  auto reg_iter = arg_regs->GetList().begin();
++  auto *used_regs = new temp::TempList();
++  int stack_args = 0;
++  for (auto arg : arg_values) {
++    if (reg_iter != arg_regs->GetList().end()) {
++      temp::Temp *reg = *reg_iter++;
++      instr_list.Append(
++          new assem::MoveInstr("movq `s0, `d0", TL(reg), TL(arg)));
++      used_regs->Append(reg);
++    } else {
++      std::ostringstream out;
++      out << "movq `s0, " << stack_args * reg_manager->WordSize() << "(%rsp)";
++      instr_list.Append(
++          new assem::MoveInstr(out.str(), nullptr, TL(arg)));
++      ++stack_args;
++    }
++  }
++
++  if (current_frame) {
++    int outgo_size = stack_args * reg_manager->WordSize();
++    current_frame->AllocOutgoSpace(
++        std::max(current_frame->outgoing_size_, outgo_size));
++  }
++  return used_regs;
+ }
+ 
+ void SeqStm::Munch(assem::InstrList &instr_list, std::string_view fs) {
+-  /* TODO: Put your lab5 code here */
+-  // SeqStm should not exist in codegen phase
+-  
+-  /* End for lab5 code */
++  assert(false);
+ }
+ 
+ void LabelStm::Munch(assem::InstrList &instr_list, std::string_view fs) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  instr_list.Append(new assem::LabelInstr(label_->Name(), label_));
+ }
+ 
+ void JumpStm::Munch(assem::InstrList &instr_list, std::string_view fs) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  instr_list.Append(new assem::OperInstr(
++      "jmp `j0", nullptr, nullptr, new assem::Targets(jumps_)));
+ }
+ 
+ void CjumpStm::Munch(assem::InstrList &instr_list, std::string_view fs) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  temp::Temp *left = left_->Munch(instr_list, fs);
++  temp::Temp *right = right_->Munch(instr_list, fs);
++  instr_list.Append(
++      new assem::OperInstr("cmpq `s0, `s1", nullptr, TL(right, left), nullptr));
++  instr_list.Append(new assem::OperInstr(
++      RelopAssem(op_) + " `j0", nullptr, nullptr,
++      new assem::Targets(new std::vector<temp::Label *>({true_label_}))));
+ }
+ 
+ void MoveStm::Munch(assem::InstrList &instr_list, std::string_view fs) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  if (auto dst_temp = dynamic_cast<tree::TempExp *>(dst_)) {
++    temp::Temp *src = src_->Munch(instr_list, fs);
++    instr_list.Append(new assem::MoveInstr("movq `s0, `d0",
++                                           TL(dst_temp->temp_), TL(src)));
++    return;
++  }
++
++  if (auto dst_mem = dynamic_cast<tree::MemExp *>(dst_)) {
++    temp::Temp *src = src_->Munch(instr_list, fs);
++    MemOperand mem = MunchMemOperand(dst_mem->exp_, instr_list, fs);
++    if (mem.src_->GetList().empty()) {
++      instr_list.Append(
++          new assem::MoveInstr("movq `s0, " + mem.assem_, nullptr, TL(src)));
++    } else {
++      temp::Temp *addr = mem.src_->NthTemp(0);
++      instr_list.Append(new assem::MoveInstr("movq `s0, (`s1)", nullptr,
++                                             TL(src, addr)));
++    }
++    return;
++  }
++
++  assert(false);
+ }
+ 
+ void ExpStm::Munch(assem::InstrList &instr_list, std::string_view fs) {
+-  /* TODO: Put your lab5 code here */
+-  
+-  /* End for lab5 code */
++  exp_->Munch(instr_list, fs);
+ }
+ 
+ temp::Temp *BinopExp::Munch(assem::InstrList &instr_list, std::string_view fs) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  temp::Temp *dst = temp::TempFactory::NewTemp();
++  temp::Temp *left = left_->Munch(instr_list, fs);
++  temp::Temp *right = right_->Munch(instr_list, fs);
++
++  switch (op_) {
++  case PLUS_OP:
++    instr_list.Append(new assem::MoveInstr("movq `s0, `d0", TL(dst), TL(left)));
++    instr_list.Append(
++        new assem::OperInstr("addq `s0, `d0", TL(dst), TL(right), nullptr));
++    return dst;
++  case MINUS_OP:
++    instr_list.Append(new assem::MoveInstr("movq `s0, `d0", TL(dst), TL(left)));
++    instr_list.Append(
++        new assem::OperInstr("subq `s0, `d0", TL(dst), TL(right), nullptr));
++    return dst;
++  case MUL_OP:
++    instr_list.Append(new assem::MoveInstr("movq `s0, `d0",
++                                           TL(reg_manager->ReturnValue()),
++                                           TL(left)));
++    instr_list.Append(new assem::OperInstr(
++        "imulq `s0", TL(reg_manager->ReturnValue()),
++        TL(right, reg_manager->ReturnValue()), nullptr));
++    instr_list.Append(new assem::MoveInstr("movq `s0, `d0", TL(dst),
++                                           TL(reg_manager->ReturnValue())));
++    return dst;
++  case DIV_OP:
++    instr_list.Append(new assem::MoveInstr("movq `s0, `d0",
++                                           TL(reg_manager->ReturnValue()),
++                                           TL(left)));
++    instr_list.Append(new assem::OperInstr(
++        "cqto", TL(reg_manager->GetRegister(frame::X64RegManager::RDX)),
++        TL(reg_manager->ReturnValue()), nullptr));
++    instr_list.Append(new assem::OperInstr(
++        "idivq `s0",
++        TL(reg_manager->ReturnValue(),
++           reg_manager->GetRegister(frame::X64RegManager::RDX)),
++        TL(right, reg_manager->ReturnValue(),
++           reg_manager->GetRegister(frame::X64RegManager::RDX)),
++        nullptr));
++    instr_list.Append(new assem::MoveInstr("movq `s0, `d0", TL(dst),
++                                           TL(reg_manager->ReturnValue())));
++    return dst;
++  default:
++    assert(false);
++  }
+ }
+ 
+ temp::Temp *MemExp::Munch(assem::InstrList &instr_list, std::string_view fs) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  temp::Temp *dst = temp::TempFactory::NewTemp();
++  MemOperand mem = MunchMemOperand(exp_, instr_list, fs);
++  instr_list.Append(
++      new assem::OperInstr("movq " + mem.assem_ + ", `d0", TL(dst), mem.src_,
++                           nullptr));
++  return dst;
+ }
+ 
+ temp::Temp *TempExp::Munch(assem::InstrList &instr_list, std::string_view fs) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  if (temp_ == reg_manager->FramePointer()) {
++    temp::Temp *dst = temp::TempFactory::NewTemp();
++    instr_list.Append(new assem::OperInstr("leaq " + std::string(fs) +
++                                               "(%rsp), `d0",
++                                           TL(dst), nullptr, nullptr));
++    return dst;
++  }
++  return temp_;
+ }
+ 
+ temp::Temp *EseqExp::Munch(assem::InstrList &instr_list, std::string_view fs) {
+-  /* TODO: Put your lab5 code here */
+-  // EseqExp should not exist in codegen phase
+-  
+-  /* End for lab5 code */
++  assert(false);
+ }
+ 
+ temp::Temp *NameExp::Munch(assem::InstrList &instr_list, std::string_view fs) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  temp::Temp *dst = temp::TempFactory::NewTemp();
++  instr_list.Append(new assem::OperInstr(
++      "leaq " + temp::LabelFactory::LabelString(name_) + "(%rip), `d0",
++      TL(dst), nullptr, nullptr));
++  return dst;
+ }
+ 
+ temp::Temp *ConstExp::Munch(assem::InstrList &instr_list, std::string_view fs) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  temp::Temp *dst = temp::TempFactory::NewTemp();
++  instr_list.Append(new assem::OperInstr("movq $" + std::to_string(consti_) +
++                                             ", `d0",
++                                         TL(dst), nullptr, nullptr));
++  return dst;
+ }
+ 
+ temp::Temp *CallExp::Munch(assem::InstrList &instr_list, std::string_view fs) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  temp::TempList *args = args_->MunchArgs(instr_list, fs);
++  auto name = dynamic_cast<tree::NameExp *>(fun_);
++  assert(name);
++  instr_list.Append(new assem::OperInstr(
++      "callq " + temp::LabelFactory::LabelString(name->name_),
++      reg_manager->CallerSaves(), args, nullptr));
++  temp::Temp *dst = temp::TempFactory::NewTemp();
++  instr_list.Append(new assem::MoveInstr("movq `s0, `d0", TL(dst),
++                                         TL(reg_manager->ReturnValue())));
++  return dst;
+ }
+ 
+ } // namespace tree
+diff --git a/src/tiger/escape/escape.cc b/src/tiger/escape/escape.cc
+index 97d3ba7..50d735d 100644
+--- a/src/tiger/escape/escape.cc
++++ b/src/tiger/escape/escape.cc
+@@ -8,138 +8,136 @@ void EscFinder::FindEscape() { absyn_tree_->Traverse(env_.get()); }
+ namespace absyn {
+ 
+ void AbsynTree::Traverse(esc::EscEnvPtr env) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  root_->Traverse(env, 0);
+ }
+ 
+ void SimpleVar::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  esc::EscapeEntry *entry = env->Look(sym_);
++  if (entry && entry->depth_ < depth) {
++    *entry->escape_ = true;
++  }
+ }
+ 
+ void FieldVar::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  var_->Traverse(env, depth);
+ }
+ 
+ void SubscriptVar::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-  
+-  /* End for lab5 code */
++  var_->Traverse(env, depth);
++  subscript_->Traverse(env, depth);
+ }
+ 
+ void VarExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-  
+-  /* End for lab5 code */
++  var_->Traverse(env, depth);
+ }
+ 
+ void NilExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-  /* End for lab5 code */
+ }
+ 
+ void IntExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-  /* End for lab5 code */
+ }
+ 
+ void StringExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-  /* End for lab5 code */
+ }
+ 
+ void CallExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-  if (!args_)
+-    return;
+-  for (Exp *arg : args_->GetList())
++  for (Exp *arg : args_->GetList()) {
+     arg->Traverse(env, depth);
+-  /* End for lab5 code */
++  }
+ }
+ 
+ void OpExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  left_->Traverse(env, depth);
++  right_->Traverse(env, depth);
+ }
+ 
+ void RecordExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  for (EField *efield : fields_->GetList()) {
++    efield->exp_->Traverse(env, depth);
++  }
+ }
+ 
+ void SeqExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  for (Exp *exp : seq_->GetList()) {
++    exp->Traverse(env, depth);
++  }
+ }
+ 
+ void AssignExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  var_->Traverse(env, depth);
++  exp_->Traverse(env, depth);
+ }
+ 
+ void IfExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  test_->Traverse(env, depth);
++  then_->Traverse(env, depth);
++  if (elsee_) {
++    elsee_->Traverse(env, depth);
++  }
+ }
+ 
+ void WhileExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  test_->Traverse(env, depth);
++  body_->Traverse(env, depth);
+ }
+ 
+ void ForExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  if (lo_) lo_->Traverse(env, depth);
++  if (hi_) hi_->Traverse(env, depth);
++  
++  env->BeginScope();
++  escape_ = false;
++  env->Enter(var_, new esc::EscapeEntry(depth, &escape_));
++  
++  if (body_) {
++    body_->Traverse(env, depth);
++  }
++  env->EndScope();
+ }
+ 
+ void BreakExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-  /* End for lab5 code */
+ }
+ 
+ void LetExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  env->BeginScope();
++  for (Dec *dec : decs_->GetList()) {
++    dec->Traverse(env, depth);
++  }
++  body_->Traverse(env, depth);
++  env->EndScope();
+ }
+ 
+ void ArrayExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  size_->Traverse(env, depth);
++  init_->Traverse(env, depth);
+ }
+ 
+ void VoidExp::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-  /* End for lab5 code */
+ }
+ 
+ void FunctionDec::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  for (FunDec *fun_dec : functions_->GetList()) {
++    env->BeginScope();
++    for (Field *field : fun_dec->params_->GetList()) {
++      field->escape_ = false;
++      env->Enter(field->name_, new esc::EscapeEntry(depth + 1, &field->escape_));
++    }
++    if (fun_dec->body_) {
++      fun_dec->body_->Traverse(env, depth + 1);
++    }
++    env->EndScope();
++  }
+ }
+ 
+ void VarDec::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  if (init_) {
++    init_->Traverse(env, depth);
++  }
++  escape_ = false;
++  env->Enter(var_, new esc::EscapeEntry(depth, &escape_));
+ }
+ 
+ void TypeDec::Traverse(esc::EscEnvPtr env, int depth) {
+-  /* TODO: Put your lab5 code here */
+-  /* End for lab5 code */
+ }
+ 
+ } // namespace absyn
+diff --git a/src/tiger/frame/frame.h b/src/tiger/frame/frame.h
+index 07c8821..55a7faf 100644
+--- a/src/tiger/frame/frame.h
++++ b/src/tiger/frame/frame.h
+@@ -4,11 +4,11 @@
+ #include <list>
+ #include <memory>
+ #include <string>
++#include <vector>
+ 
++#include "tiger/codegen/assem.h"
+ #include "tiger/frame/temp.h"
+ #include "tiger/translate/tree.h"
+-#include "tiger/codegen/assem.h"
+-
+ 
+ namespace frame {
+ 
+@@ -70,18 +70,31 @@ protected:
+ 
+ class Access {
+ public:
+-  /* TODO: Put your lab5 code here */
+-  
+-  /* End for lab5 code */
+-  
+   virtual ~Access() = default;
+-  
++  virtual tree::Exp *ToExp(tree::Exp *frame_ptr) const = 0;
+ };
+ 
+ class Frame {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++public:
++  int word_size_;
++  int outgoing_size_;
++  temp::Label *name_;
++  std::list<frame::Access *> *formals_;
++  std::list<frame::Access *> *locals_;
++  int local_offset_;
++
++  Frame(int word_size, int outgoing_size, temp::Label *name,
++        std::list<frame::Access *> *formals)
++      : word_size_(word_size), outgoing_size_(outgoing_size), name_(name),
++        formals_(formals), locals_(new std::list<frame::Access *>()),
++        local_offset_(0) {}
++
++  virtual ~Frame() = default;
++  virtual std::string GetLabel() const = 0;
++  virtual temp::Label *Name() const = 0;
++  virtual std::list<frame::Access *> *Formals() const = 0;
++  virtual frame::Access *AllocLocal(bool escape) = 0;
++  virtual void AllocOutgoSpace(int size) = 0;
+ };
+ 
+ /**
+@@ -97,10 +110,6 @@ public:
+     String,
+   };
+ 
+-  /**
+-   *Generate assembly for main program
+-   * @param out FILE object for output assembly file
+-   */
+   virtual void OutputAssem(FILE *out, OutputPhase phase, bool need_ra) const = 0;
+ };
+ 
+@@ -128,17 +137,16 @@ public:
+ class Frags {
+ public:
+   Frags() = default;
+-  void PushBack(Frag *frag) { frags_.emplace_back(frag); }
++  void PushBack(Frag *frag) { frags_.push_back(frag); }
+   const std::list<Frag*> &GetList() { return frags_; }
+ 
+ private:
+   std::list<Frag*> frags_;
+ };
+ 
+-/* TODO: Put your lab5 code here */
+-
+-/* End for lab5 code */
++frame::Frame *NewFrame(temp::Label *name, std::list<bool> formals);
++assem::Proc *ProcEntryExit3(frame::Frame *frame, assem::InstrList *body);
+ 
+ } // namespace frame
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/tiger/frame/x64frame.cc b/src/tiger/frame/x64frame.cc
+index 4009897..4801acf 100644
+--- a/src/tiger/frame/x64frame.cc
++++ b/src/tiger/frame/x64frame.cc
+@@ -1,45 +1,85 @@
+ #include "tiger/frame/x64frame.h"
++#include <array>
++#include <sstream>
+ 
+ extern frame::RegManager *reg_manager;
+ 
+ namespace frame {
+ 
+ X64RegManager::X64RegManager() : RegManager() {
+-    /* TODO: Put your lab5 code here */
++  for (int i = 0; i < REG_COUNT; i++)
++    RegManager::regs_.push_back(temp::TempFactory::NewTemp());
++
++  // Note: no frame pointer in tiger compiler
++  const char* reg_name[REG_COUNT] = {
++      "%rax", "%rbx", "%rcx", "%rdx", "%rsi", "%rdi", "%rbp", "%rsp",
++      "%r8",  "%r9",  "%r10", "%r11", "%r12", "%r13", "%r14", "%r15",
++      "%fp"};  // FP is a pseudo-register
++  int reg = RAX;
++  for (int i = 0; i < REG_COUNT; i++) {
++    RegManager::temp_map_->Enter(RegManager::regs_[reg], new std::string(reg_name[i]));
++    reg++;
++  }
+ }
+ 
+ temp::TempList *X64RegManager::Registers() {
+-    /* TODO: Put your lab5 code here */
++  const std::array<Reg, 15> reg_array{
++      RAX, RBX, RCX, RDX, RSI, RDI, RBP, R8, R9, R10, R11, R12, R13, R14, R15,
++  };
++  auto *temp_list = new temp::TempList();
++  for (auto &reg : reg_array)
++    temp_list->Append(RegManager::regs_[reg]);
++  return temp_list;
+ }
+ 
+ temp::TempList *X64RegManager::ArgRegs() {
+-    /* TODO: Put your lab5 code here */
++  const std::array<Reg, 6> reg_array{RDI, RSI, RDX, RCX, R8, R9};
++  auto *temp_list = new temp::TempList();
++  for (auto &reg : reg_array)
++    temp_list->Append(RegManager::regs_[reg]);
++  return temp_list;
+ }
+ 
+ temp::TempList *X64RegManager::CallerSaves() {
+-    /* TODO: Put your lab5 code here */
++  const std::array<Reg, 9> reg_array{RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11};
++  auto *temp_list = new temp::TempList();
++  for (auto &reg : reg_array)
++    temp_list->Append(RegManager::regs_[reg]);
++  return temp_list;
+ }
+ 
+ temp::TempList *X64RegManager::CalleeSaves() {
+-    /* TODO: Put your lab5 code here */
++  const std::array<Reg, 6> reg_array{RBP, RBX, R12, R13, R14, R15};
++  auto *temp_list = new temp::TempList();
++  for (auto &reg : reg_array)
++    temp_list->Append(RegManager::regs_[reg]);
++  return temp_list;
+ }
+ 
+ temp::TempList *X64RegManager::ReturnSink() {
+-    /* TODO: Put your lab5 code here */
++  temp::TempList *temp_list = CalleeSaves();
++  temp_list->Append(RegManager::regs_[SP]);
++  temp_list->Append(RegManager::regs_[RV]);
++  return temp_list;
+ }
+ 
+-int X64RegManager::WordSize() { /* TODO: Put your lab5 code here */ }
++int X64RegManager::WordSize() { return 8; }
+ 
+-temp::Temp *X64RegManager::FramePointer() { /* TODO: Put your lab5 code here */ }
++temp::Temp *X64RegManager::FramePointer() { return RegManager::regs_[FP]; }
+ 
+-temp::Temp *X64RegManager::StackPointer() { /* TODO: Put your lab5 code here */ }
++temp::Temp *X64RegManager::StackPointer() { return RegManager::regs_[SP]; }
+ 
+-temp::Temp *X64RegManager::ReturnValue() { /* TODO: Put your lab5 code here */ }
++temp::Temp *X64RegManager::ReturnValue() { return RegManager::regs_[RV]; }
+ 
+ class InFrameAccess : public Access {
+-  /* TODO: Put your lab5 code here */
+-  
+-  /* End for lab5 code */
++public:
++  int offset;
++
++  explicit InFrameAccess(int offset) : offset(offset) {}
++  tree::Exp *ToExp(tree::Exp *frame_ptr) const override {
++    return new tree::MemExp(new tree::BinopExp(tree::PLUS_OP, frame_ptr,
++                                               new tree::ConstExp(offset)));
++  }
+ };
+ 
+ 
+@@ -48,28 +88,163 @@ public:
+   temp::Temp *reg;
+ 
+   explicit InRegAccess(temp::Temp *reg) : reg(reg) {}
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++  tree::Exp *ToExp(tree::Exp *framePtr) const override {
++    return new tree::TempExp(reg);
++  }
+ };
+ 
+ class X64Frame : public Frame {
+-  /* TODO: Put your lab5 code here */
+-
+-  /* End for lab5 code */
++public:
++  tree::Stm *view_shift;
++
++  X64Frame(temp::Label *name, std::list<frame::Access *> *formals)
++      : Frame(8, 0, name, formals), view_shift(nullptr) {}
++
++  [[nodiscard]] std::string GetLabel() const override { 
++    return name_ ? name_->Name() : ""; 
++  }
++  [[nodiscard]] temp::Label *Name() const override { return name_; }
++  [[nodiscard]] std::list<frame::Access *> *Formals() const override {
++    return formals_;
++  }
++  frame::Access *AllocLocal(bool escape) override {
++    frame::Access *access = nullptr;
++    if (escape) {
++      local_offset_ -= word_size_;
++      access = new InFrameAccess(local_offset_);
++    } else {
++      access = new InRegAccess(temp::TempFactory::NewTemp());
++    }
++    // 关键修复：分配的局部变量必须加入到 locals_ 列表中，供后端计算栈大小
++    locals_->push_back(access);
++    return access;
++  }
++  void AllocOutgoSpace(int size) override {
++    outgoing_size_ = size;
++  }
+ };
+ 
+-/* TODO: Put your lab5 code here */
+-
+ frame::Frame *NewFrame(temp::Label *name, std::list<bool> formals) {
+-    /* TODO: Put your lab5 code here */
++  auto *access_list = new std::list<frame::Access *>();
++  auto *frame = new X64Frame(name, access_list);
++  
++  temp::TempList *arg_regs = reg_manager->ArgRegs();
++  auto arg_reg_it = arg_regs->GetList().begin();
++  
++  // 超过 6 个的栈参数，从第 7 个开始算（考虑返回地址 8 字节，从 8 开始正向偏移）
++  int incoming_stack_offset = 8;
++  tree::Stm *shift_stm = nullptr;
++
++  for (bool escape : formals) {
++    frame::Access *access = nullptr;
++
++    if (arg_reg_it != arg_regs->GetList().end()) {
++      // 寄存器传参 (前 6 个)
++      temp::Temp *actual_reg = *arg_reg_it++;
++      access = frame->AllocLocal(escape);
++      
++      // 使用 FramePointer() 作为基址生成赋值语句
++      tree::Stm *move_formal = new tree::MoveStm(
++          access->ToExp(new tree::TempExp(reg_manager->FramePointer())),
++          new tree::TempExp(actual_reg)
++      );
++      
++      if (!shift_stm) shift_stm = move_formal;
++      else shift_stm = new tree::SeqStm(shift_stm, move_formal);
++    } else {
++      // 栈传参 (第 7 个及以后)
++      access = new InFrameAccess(incoming_stack_offset);
++      incoming_stack_offset += 8;
++      
++      // 注意：栈传参本身已经在调用者的栈帧里了，当前函数不需要为它开辟空间
++      // 因此不需要加入 locals_，只需要加入 formals_ 即可
++    }
++
++    // 必须同步塞入外层传入的形参列表
++    access_list->push_back(access);
++  }
++
++  frame->view_shift = shift_stm;
++  return frame;
++}
++
++tree::Exp *ExternalCall(const std::string& s, tree::ExpList *args) {
++  // Prepend a magic exp at first arg, indicating do not pass static link on
++  // stack
++  args->Insert(new tree::NameExp(temp::LabelFactory::NamedLabel("staticLink")));
++  return new tree::CallExp(new tree::NameExp(temp::LabelFactory::NamedLabel(s)),
++                           args);
+ }
+ 
+-tree::Exp *ExternalCall(std::string_view s, tree::ExpList *args) {
+-    /* TODO: Put your lab5 code here */
++/**
++ * Moving incoming formal parameters, the saving and restoring of callee-save
++ * Registers
++ * @param frame curruent frame
++ * @param stm statements
++ * @return statements with saving, restoring and view shift
++ */
++tree::Stm *ProcEntryExit1(frame::Frame *frame, tree::Stm *stm) {
++  auto x64_frame = dynamic_cast<frame::X64Frame *>(frame);
++  assert(x64_frame);
++
++  auto callee_list = new tree::ExpList();
++
++  // Save callee-saved register
++  tree::Stm *save_stm = nullptr;
++  temp::TempList *callees = reg_manager->CalleeSaves();
++  for (auto callee : callees->GetList()) {
++    temp::Temp *r = temp::TempFactory::NewTemp();
++    if (!save_stm)
++      save_stm =
++          new tree::MoveStm(new tree::TempExp(r), new tree::TempExp(callee));
++    else
++      save_stm = new tree::SeqStm(
++          save_stm,
++          new tree::MoveStm(new tree::TempExp(r), new tree::TempExp(callee)));
++    callee_list->Append(new tree::TempExp(r));
++  }
++
++  // Restore callee-saved register
++  tree::Stm *restore_stm = nullptr;
++  callees = reg_manager->CalleeSaves();
++  auto callee_it = callee_list->GetList().begin();
++  for (auto callee : callees->GetList()) {
++    assert(callee_it != callee_list->GetList().end());
++    if (!restore_stm)
++      restore_stm = new tree::MoveStm(new tree::TempExp(callee), *callee_it++);
++    else
++      restore_stm = new tree::SeqStm(
++          restore_stm,
++          new tree::MoveStm(new tree::TempExp(callee), *callee_it++));
++  }
++
++  // Add view shift for arguments
++  tree::Stm *exit_stm;
++  if (x64_frame->view_shift == nullptr) {
++    // Outermost frame and functions with no formals do not have formal access_
++    // list and view shift
++    exit_stm = new tree::SeqStm(save_stm, new tree::SeqStm(stm, restore_stm));
++  } else
++    exit_stm = new tree::SeqStm(
++        save_stm, new tree::SeqStm(x64_frame->view_shift,
++                                   new tree::SeqStm(stm, restore_stm)));
++  return exit_stm;
+ }
+ 
++assem::Proc *ProcEntryExit3(frame::Frame *frame, assem::InstrList *body) {
++  int frame_size = -frame->local_offset_ + frame->outgoing_size_;
++  std::string frame_size_label = frame->GetLabel() + "_framesize";
+ 
+-/* End for lab5 code */
++  std::ostringstream prolog;
++  prolog << ".set " << frame_size_label << ", " << frame_size << "\n";
++  prolog << frame->GetLabel() << ":\n";
++  prolog << "subq $" << frame_size << ", %rsp\n";
++
++  std::ostringstream epilog;
++  epilog << "addq $" << frame_size << ", %rsp\n";
++  epilog << "retq\n";
++
++  return new assem::Proc(prolog.str(), body, epilog.str());
++}
+ 
+ } // namespace frame
+diff --git a/src/tiger/frame/x64frame.h b/src/tiger/frame/x64frame.h
+index 35b0326..bb9c1dc 100644
+--- a/src/tiger/frame/x64frame.h
++++ b/src/tiger/frame/x64frame.h
+@@ -1,7 +1,3 @@
+-//
+-// Created by wzl on 2021/10/12.
+-//
+-
+ #ifndef TIGER_COMPILER_X64FRAME_H
+ #define TIGER_COMPILER_X64FRAME_H
+ 
+@@ -9,10 +5,54 @@
+ 
+ namespace frame {
+ class X64RegManager : public RegManager {
+-  /* TODO: Put your lab5 code here */
++public:
++  enum Reg : unsigned long {
++    RAX,
++    RBX,
++    RCX,
++    RDX,
++    RSI,
++    RDI,
++    RBP,
++    RSP,
++    R8,
++    R9,
++    R10,
++    R11,
++    R12,
++    R13,
++    R14,
++    R15,
++    FP,
++    REG_COUNT,
++    SP = RSP, // use RSP as SP
++    RV = RAX, // use RAX as RV
++  };
++
++  X64RegManager();
++
++  [[nodiscard]] temp::TempList *Registers() override;
++
++  [[nodiscard]] temp::TempList *ArgRegs() override;
++
++  [[nodiscard]] temp::TempList *CallerSaves() override;
++
++  [[nodiscard]] temp::TempList *CalleeSaves() override;
+ 
+-  /* End for lab5 code */
++  [[nodiscard]] temp::TempList *ReturnSink() override;
++
++  [[nodiscard]] int WordSize() override;
++
++  [[nodiscard]] temp::Temp *FramePointer() override;
++
++  [[nodiscard]] temp::Temp *StackPointer() override;
++
++  [[nodiscard]] temp::Temp *ReturnValue() override;
++  
+ };
+ 
++tree::Exp *ExternalCall(const std::string& s, tree::ExpList *args);
++tree::Stm *ProcEntryExit1(frame::Frame *frame, tree::Stm *stm);
++
+ } // namespace frame
+ #endif // TIGER_COMPILER_X64FRAME_H
+diff --git a/src/tiger/lex/scanner.h b/src/tiger/lex/scanner.h
+index b768822..1f37164 100644
+--- a/src/tiger/lex/scanner.h
++++ b/src/tiger/lex/scanner.h
+@@ -14,7 +14,7 @@ class Scanner : public ScannerBase {
+ public:
+   Scanner() = delete;
+   explicit Scanner(std::string_view fname, std::ostream &out = std::cout)
+-      : ScannerBase(std::cin, out), comment_level_(1), char_pos_(1),
++      : ScannerBase(std::cin, out), comment_level_(0), char_pos_(1),
+         errormsg_(std::make_unique<err::ErrorMsg>(fname)) {
+     switchStreams(errormsg_->infile_, out);
+   }
+diff --git a/src/tiger/main/test_translate.cc b/src/tiger/main/test_translate.cc
+index c347fec..0dca45c 100644
+--- a/src/tiger/main/test_translate.cc
++++ b/src/tiger/main/test_translate.cc
+@@ -55,4 +55,3 @@ int main(int argc, char **argv) {
+ 
+   return 0;
+ }
+-
+diff --git a/src/tiger/semant/semant.cc b/src/tiger/semant/semant.cc
+index 1af6ebf..a6ccbaa 100644
+--- a/src/tiger/semant/semant.cc
++++ b/src/tiger/semant/semant.cc
+@@ -1,162 +1,466 @@
+ #include "tiger/absyn/absyn.h"
+ #include "tiger/semant/semant.h"
++#include <set>
++#include <vector>
+ 
+ namespace absyn {
+ 
++namespace {
++  std::vector<sym::Symbol *> readonly_vars_stack;
++}
++
+ void AbsynTree::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                            err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  root_->SemAnalyze(venv, tenv, 0, errormsg);
+ }
+ 
+ type::Ty *SimpleVar::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                 int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  env::EnvEntry *entry = venv->Look(sym_);
++  if (!entry) {
++    errormsg->Error(pos_, "undefined variable " + sym_->Name());
++    return type::IntTy::Instance();
++  }
++  env::VarEntry *var_entry = dynamic_cast<env::VarEntry *>(entry);
++  if (!var_entry) {
++    errormsg->Error(pos_, "undefined variable " + sym_->Name());
++    return type::IntTy::Instance();
++  }
++  return var_entry->ty_;
+ }
+ 
+ type::Ty *FieldVar::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  type::Ty *var_ty = var_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  type::RecordTy *record_ty = dynamic_cast<type::RecordTy *>(var_ty->ActualTy());
++  if (!record_ty) {
++    errormsg->Error(pos_, "not a record type");
++    return type::VoidTy::Instance();
++  }
++  for (type::Field *field : record_ty->fields_->GetList()) {
++    if (field->name_->Name() == sym_->Name()) {
++      return field->ty_;
++    }
++  }
++  errormsg->Error(pos_, "field nam doesn't exist");
++  return type::VoidTy::Instance();
+ }
+ 
+ type::Ty *SubscriptVar::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                    int labelcount,
+                                    err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  type::Ty *var_ty = var_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  type::ArrayTy *array_ty = dynamic_cast<type::ArrayTy *>(var_ty->ActualTy());
++  if (!array_ty) {
++    errormsg->Error(pos_, "array type required");
++    return type::VoidTy::Instance();
++  }
++  return array_ty->ty_;
+ }
+ 
+ type::Ty *VarExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                              int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  return var_->SemAnalyze(venv, tenv, labelcount, errormsg);
+ }
+ 
+ type::Ty *NilExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                              int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  return type::NilTy::Instance();
+ }
+ 
+ type::Ty *IntExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                              int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  return type::IntTy::Instance();
+ }
+ 
+ type::Ty *StringExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                 int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  return type::StringTy::Instance();
+ }
+ 
+ type::Ty *CallExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                               int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  env::EnvEntry *entry = venv->Look(func_);
++  if (!entry) {
++    std::string msg = "undefined function " + func_->Name();
++    errormsg->Error(pos_, msg);
++    return type::IntTy::Instance();
++  }
++  env::FunEntry *fun_entry = dynamic_cast<env::FunEntry *>(entry);
++  if (!fun_entry) {
++    std::string msg = "undefined function " + func_->Name();
++    errormsg->Error(pos_, msg);
++    return type::IntTy::Instance();
++  }
++  const std::list<type::Ty *> &formals = fun_entry->formals_->GetList();
++  const std::list<Exp *> &args = args_->GetList();
++  
++  bool param_cnt_ok = true;
++  if (formals.size() != args.size()) {
++    param_cnt_ok = false;
++    if (formals.size() < args.size()) {
++      errormsg->Error(pos_, "too many params in function " + func_->Name());
++    } else {
++      errormsg->Error(pos_, "too few params in function " + func_->Name());
++    }
++  }
++  
++  auto formal_it = formals.begin();
++  auto arg_it = args.begin();
++  for (; formal_it != formals.end() && arg_it != args.end();
++       ++formal_it, ++arg_it) {
++    type::Ty *arg_ty = (*arg_it)->SemAnalyze(venv, tenv, labelcount, errormsg);
++    if (arg_ty->ActualTy() != type::VoidTy::Instance()) {
++      if (!(*formal_it)->IsSameType(arg_ty)) {
++        errormsg->Error(pos_, "para type mismatch");
++      }
++    }
++  }
++  return fun_entry->result_;
+ }
+ 
+ type::Ty *OpExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                             int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  type::Ty *left_ty = left_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  type::Ty *right_ty = right_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  
++  switch (oper_) {
++    case PLUS_OP:
++    case MINUS_OP:
++    case TIMES_OP:
++    case DIVIDE_OP:
++    case AND_OP:
++    case OR_OP:
++      if (!left_ty->IsSameType(type::IntTy::Instance())) {
++        errormsg->Error(left_->pos_, "integer required");
++      }
++      if (!right_ty->IsSameType(type::IntTy::Instance())) {
++        errormsg->Error(right_->pos_, "integer required");
++      }
++      return type::IntTy::Instance();
++      
++    case EQ_OP:
++    case NEQ_OP:
++      if (!left_ty->IsSameType(right_ty)) {
++        errormsg->Error(pos_, "same type required");
++      } else {
++        if (left_ty->ActualTy() == type::NilTy::Instance() &&
++            right_ty->ActualTy() == type::NilTy::Instance()) {
++          errormsg->Error(pos_, "same type required");
++        }
++      }
++      return type::IntTy::Instance();
++      
++    case LT_OP:
++    case LE_OP:
++    case GT_OP:
++    case GE_OP:
++      if (!left_ty->IsSameType(right_ty)) {
++        errormsg->Error(pos_, "same type required");
++      } else {
++        type::Ty *actual = left_ty->ActualTy();
++        if (!dynamic_cast<type::IntTy *>(actual) && !dynamic_cast<type::StringTy *>(actual)) {
++          errormsg->Error(left_->pos_, "integer required");
++        }
++      }
++      return type::IntTy::Instance();
++      
++    default:
++      errormsg->Error(pos_, "unknown operator");
++      return type::VoidTy::Instance();
++  }
+ }
+ 
+ type::Ty *RecordExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                 int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  type::Ty *ty = tenv->Look(typ_);
++  if (!ty) {
++    errormsg->Error(pos_, "undefined type " + typ_->Name());
++    return type::VoidTy::Instance();
++  }
++  type::RecordTy *record_ty = dynamic_cast<type::RecordTy *>(ty->ActualTy());
++  if (!record_ty) {
++    errormsg->Error(pos_, "not a record type");
++    return type::VoidTy::Instance();
++  }
++  const std::list<type::Field *> &fields = record_ty->fields_->GetList();
++  const std::list<EField *> &efields = fields_->GetList();
++  auto field_it = fields.begin();
++  auto efield_it = efields.begin();
++  for (; field_it != fields.end() && efield_it != efields.end();
++       ++field_it, ++efield_it) {
++    if ((*field_it)->name_->Name() != (*efield_it)->name_->Name()) {
++      errormsg->Error(pos_, "field name mismatch");
++    }
++  }
++  if (fields.size() != efields.size()) {
++    errormsg->Error(pos_, "field number mismatch");
++  }
++  return record_ty;
+ }
+ 
+ type::Ty *SeqExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                              int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
+-}
+-
+-type::Ty *AssignExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+-                                int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  type::Ty *result = type::VoidTy::Instance();
++  for (Exp *exp : seq_->GetList()) {
++    result = exp->SemAnalyze(venv, tenv, labelcount, errormsg);
++  }
++  return result;
+ }
+ 
+ type::Ty *IfExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                             int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  type::Ty *test_ty = test_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  if (!test_ty->IsSameType(type::IntTy::Instance())) {
++    errormsg->Error(pos_, "if test must be int");
++  }
++  type::Ty *then_ty = then_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  type::Ty *else_ty = nullptr;
++  bool has_else = elsee_ != nullptr;
++  if (has_else) {
++    else_ty = elsee_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  } else {
++    else_ty = type::VoidTy::Instance();
++  }
++  if (!has_else) {
++    if (!then_ty->IsSameType(type::VoidTy::Instance())) {
++      errormsg->Error(pos_, "if-then exp's body must produce no value");
++    }
++    return type::VoidTy::Instance();
++  }
++  if (!then_ty->IsSameType(else_ty)) {
++    errormsg->Error(pos_, "then exp and else exp type mismatch");
++  }
++  return then_ty;
+ }
+ 
+ type::Ty *WhileExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  type::Ty *test_ty = test_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  if (!test_ty->IsSameType(type::IntTy::Instance())) {
++    errormsg->Error(pos_, "while test must be int");
++  }
++  type::Ty *body_ty = body_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  if (!body_ty->IsSameType(type::VoidTy::Instance())) {
++    errormsg->Error(pos_, "while body must produce no value");
++  }
++  return type::VoidTy::Instance();
+ }
+ 
+ type::Ty *ForExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                              int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  type::Ty *lo_ty = lo_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  type::Ty *hi_ty = hi_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  if (!lo_ty->IsSameType(type::IntTy::Instance())) {
++    errormsg->Error(pos_, "for exp's range type is not integer");
++  }
++  if (!hi_ty->IsSameType(type::IntTy::Instance())) {
++    errormsg->Error(pos_, "for exp's range type is not integer");
++  }
++  venv->BeginScope();
++  venv->Enter(var_, new env::VarEntry(type::IntTy::Instance()));
++  readonly_vars_stack.push_back(var_);
++  type::Ty *body_ty = body_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  readonly_vars_stack.pop_back();
++  venv->EndScope();
++  if (!body_ty->IsSameType(type::VoidTy::Instance())) {
++    errormsg->Error(pos_, "for body must produce no value");
++  }
++  return type::VoidTy::Instance();
+ }
+ 
+ type::Ty *BreakExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  return type::VoidTy::Instance();
+ }
+ 
+ type::Ty *LetExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                              int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  venv->BeginScope();
++  tenv->BeginScope();
++  for (Dec *dec : decs_->GetList()) {
++    dec->SemAnalyze(venv, tenv, labelcount, errormsg);
++  }
++  type::Ty *body_ty = body_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  venv->EndScope();
++  tenv->EndScope();
++  return body_ty;
+ }
+ 
+ type::Ty *ArrayExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  type::Ty *ty = tenv->Look(typ_);
++  if (!ty) {
++    errormsg->Error(pos_, "undefined type " + typ_->Name());
++    return type::VoidTy::Instance();
++  }
++  type::ArrayTy *array_ty = dynamic_cast<type::ArrayTy *>(ty->ActualTy());
++  if (!array_ty) {
++    errormsg->Error(pos_, "array type required");
++    return type::VoidTy::Instance();
++  }
++  type::Ty *size_ty = size_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  type::Ty *init_ty = init_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  if (!array_ty->ty_->IsSameType(init_ty)) {
++    errormsg->Error(pos_, "type mismatch");
++  }
++  return array_ty;
+ }
+ 
+ type::Ty *VoidExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                               int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
++  return type::VoidTy::Instance();
++}
+ 
++type::Ty *AssignExp::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
++                                int labelcount, err::ErrorMsg *errormsg) const {
++  type::Ty *var_ty = var_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  type::Ty *exp_ty = exp_->SemAnalyze(venv, tenv, labelcount, errormsg);
++
++  // 修复：禁止给 for 循环变量赋值
++  if (auto simple_var = dynamic_cast<SimpleVar*>(var_)) {
++    for (auto it = readonly_vars_stack.rbegin(); it != readonly_vars_stack.rend(); ++it) {
++      if (*it == simple_var->sym_) {
++        errormsg->Error(pos_, "loop variable can't be assigned");
++        break;
++      }
++    }
++  }
++
++  if (!var_ty->IsSameType(exp_ty)) {
++    errormsg->Error(pos_, "unmatched assign exp");
++  }
++  return type::VoidTy::Instance();
+ }
+ 
+ void FunctionDec::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv,
+                              int labelcount, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  std::set<std::string> current_func_names;
++  for (FunDec *fun_dec : functions_->GetList()) {
++    if (current_func_names.count(fun_dec->name_->Name())) {
++      errormsg->Error(fun_dec->pos_, "two functions have the same name");
++      continue;
++    }
++    current_func_names.insert(fun_dec->name_->Name());
++    type::TyList *formals = fun_dec->params_->MakeFormalTyList(tenv, errormsg);
++    type::Ty *result = type::VoidTy::Instance();
++    if (fun_dec->result_) {
++      result = tenv->Look(fun_dec->result_);
++      if (!result) {
++        errormsg->Error(fun_dec->pos_, "undefined result type");
++        result = type::VoidTy::Instance();
++      }
++    }
++    venv->Enter(fun_dec->name_, new env::FunEntry(formals, result));
++  }
++  for (FunDec *fun_dec : functions_->GetList()) {
++    venv->BeginScope();
++    for (Field *field : fun_dec->params_->GetList()) {
++      type::Ty *ty = tenv->Look(field->typ_);
++      if (!ty) {
++        errormsg->Error(field->pos_, "undefined type");
++        ty = type::VoidTy::Instance();
++      }
++      venv->Enter(field->name_, new env::VarEntry(ty));
++    }
++    type::Ty *body_ty = fun_dec->body_->SemAnalyze(venv, tenv, labelcount, errormsg);
++    env::FunEntry *fe = dynamic_cast<env::FunEntry *>(venv->Look(fun_dec->name_));
++    if (fe && fe->result_->ActualTy() == type::VoidTy::Instance() && 
++        body_ty->ActualTy() != type::VoidTy::Instance()) {
++      errormsg->Error(fun_dec->pos_, "procedure returns value");
++    }
++    venv->EndScope();
++  }
+ }
+ 
+ void VarDec::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv, int labelcount,
+                         err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  type::Ty *ty = nullptr;
++  if (typ_) {
++    ty = tenv->Look(typ_);
++    if (!ty) {
++      errormsg->Error(pos_, "undefined type " + typ_->Name());
++      ty = type::VoidTy::Instance();
++    }
++  }
++  type::Ty *init_ty = init_->SemAnalyze(venv, tenv, labelcount, errormsg);
++  if (init_ty == type::NilTy::Instance() && !typ_) {
++    errormsg->Error(pos_, "init should not be nil without type specified");
++  }
++  if (!ty) {
++    ty = init_ty;
++  } else {
++    type::Ty *actual_ty = ty->ActualTy();
++    if (init_ty == type::NilTy::Instance() &&
++        dynamic_cast<type::RecordTy *>(actual_ty)) {
++    } else if (!ty->IsSameType(init_ty)) {
++      errormsg->Error(pos_, "type mismatch");
++    }
++  }
++  venv->Enter(var_, new env::VarEntry(ty));
+ }
+ 
+ void TypeDec::SemAnalyze(env::VEnvPtr venv, env::TEnvPtr tenv, int labelcount,
+                          err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  std::set<std::string> current_names;
++  for (NameAndTy *nat : types_->GetList()) {
++    if (current_names.count(nat->name_->Name())) {
++      errormsg->Error(nat->ty_->pos_, "two types have the same name");
++    } else {
++      current_names.insert(nat->name_->Name());
++      tenv->Enter(nat->name_, new type::NameTy(nat->name_, nullptr));
++    }
++  }
++  for (NameAndTy *nat : types_->GetList()) {
++    type::Ty *res_ty = nat->ty_->SemAnalyze(tenv, errormsg);
++    type::NameTy *name_ty = dynamic_cast<type::NameTy *>(tenv->Look(nat->name_));
++    if (name_ty) {
++      name_ty->ty_ = res_ty;
++    }
++  }
++  for (NameAndTy *nat : types_->GetList()) {
++    type::Ty *initial = tenv->Look(nat->name_);
++    type::Ty *curr = initial;
++    while (curr) {
++      auto next = dynamic_cast<type::NameTy *>(curr);
++      if (!next || !next->ty_) break;
++      curr = next->ty_;
++      if (curr == initial) {
++        errormsg->Error(nat->ty_->pos_, "illegal type cycle");
++        if (auto name_ty = dynamic_cast<type::NameTy *>(initial)) {
++          name_ty->ty_ = type::VoidTy::Instance();
++        }
++        break;
++      }
++    }
++  }
+ }
+ 
+ type::Ty *NameTy::SemAnalyze(env::TEnvPtr tenv, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  type::Ty *ty = tenv->Look(name_);
++  if (!ty) {
++    std::string msg = "undefined type " + name_->Name();
++    errormsg->Error(pos_, msg);
++    return type::VoidTy::Instance();
++  }
++  return new type::NameTy(name_, ty);
+ }
+ 
+ type::Ty *RecordTy::SemAnalyze(env::TEnvPtr tenv,
+                                err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  type::FieldList *fields = record_->MakeFieldList(tenv, errormsg);
++  return new type::RecordTy(fields);
+ }
+ 
+ type::Ty *ArrayTy::SemAnalyze(env::TEnvPtr tenv,
+                               err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab4 code here */
+-
++  type::Ty *ty = tenv->Look(array_);
++  if (!ty) {
++    std::string msg = "undefined type " + array_->Name();
++    errormsg->Error(pos_, msg);
++    return type::VoidTy::Instance();
++  }
++  return new type::ArrayTy(ty);
+ }
+ 
+ } // namespace absyn
+@@ -164,9 +468,9 @@ type::Ty *ArrayTy::SemAnalyze(env::TEnvPtr tenv,
+ namespace sem {
+ 
+ void ProgSem::SemAnalyze() {
+-  FillBaseVEnv();
+   FillBaseTEnv();
++  FillBaseVEnv();
+   absyn_tree_->SemAnalyze(venv_.get(), tenv_.get(), errormsg_.get());
+ }
+ 
+-} // namespace tr
++} // namespace sem
+\ No newline at end of file
+diff --git a/src/tiger/semant/semant.h b/src/tiger/semant/semant.h
+index 09fa0dc..00eca52 100644
+--- a/src/tiger/semant/semant.h
++++ b/src/tiger/semant/semant.h
+@@ -33,14 +33,6 @@ public:
+     return std::move(errormsg_);
+   }
+ 
+-  /**
+-   * Transfer the ownership of absyn tree to outer scope
+-   * @return unique pointer to the absyn tree
+-   */
+-  std::unique_ptr<absyn::AbsynTree> TransferAbsynTree() {
+-    return std::move(absyn_tree_);
+-  }
+-
+ private:
+   std::unique_ptr<absyn::AbsynTree> absyn_tree_;
+   std::unique_ptr<err::ErrorMsg> errormsg_;
+diff --git a/src/tiger/translate/translate.cc b/src/tiger/translate/translate.cc
+index 9f4f0a9..30f02cf 100644
+--- a/src/tiger/translate/translate.cc
++++ b/src/tiger/translate/translate.cc
+@@ -11,27 +11,32 @@
+ extern frame::Frags *frags;
+ extern frame::RegManager *reg_manager;
+ 
+-namespace {
+-frame::ProcFrag *ProcEntryExit(tr::Level *level, tr::Exp *body);
+-}
+-
+-namespace tr {
++// 循环标签栈：用于 break 语句跳转到正确的循环结束位置
++static std::vector<temp::Label *> loop_stack;
+ 
+-Access *Access::AllocLocal(Level *level, bool escape) {
+-  /* TODO: Put your lab5 code here */
+-
+-}
++namespace {
+ 
+ class Cx {
+ public:
+-  PatchList trues_;
+-  PatchList falses_;
++  tr::PatchList trues_;
++  tr::PatchList falses_;
+   tree::Stm *stm_;
+ 
+-  Cx(PatchList trues, PatchList falses, tree::Stm *stm)
++  Cx() : trues_(tr::PatchList()), falses_(tr::PatchList()), stm_(nullptr) {}
++  Cx(tr::PatchList trues, tr::PatchList falses, tree::Stm *stm)
+       : trues_(trues), falses_(falses), stm_(stm) {}
+ };
+ 
++frame::ProcFrag *ProcEntryExit(tr::Level *level, tr::Exp *body);
++}
++
++namespace tr {
++
++Access *Access::AllocLocal(Level *level, bool escape) {
++  frame::Access *access = level->frame_->AllocLocal(escape);
++  return new Access(level, access);
++}
++
+ class Exp {
+ public:
+   [[nodiscard]] virtual tree::Exp *UnEx() const = 0;
+@@ -54,16 +59,19 @@ public:
+   explicit ExExp(tree::Exp *exp) : exp_(exp) {}
+ 
+   [[nodiscard]] tree::Exp *UnEx() const override { 
+-    /* TODO: Put your lab5 code here */
+-
++    return exp_;
+   }
+   [[nodiscard]] tree::Stm *UnNx() const override {
+-    /* TODO: Put your lab5 code here */
+-
++    return new tree::ExpStm(exp_);
+   }
+   [[nodiscard]] Cx UnCx(err::ErrorMsg *errormsg) const override {
+-    /* TODO: Put your lab5 code here */
+-
++    temp::Label *true_label = temp::LabelFactory::NewLabel();
++    temp::Label *false_label = temp::LabelFactory::NewLabel();
++    tree::Stm *stm = new tree::CjumpStm(tree::NE_OP, exp_, new tree::ConstExp(0),
++                                        true_label, false_label);
++    tr::PatchList trues({&true_label});
++    tr::PatchList falses({&false_label});
++    return Cx(trues, falses, stm);
+   }
+ };
+ 
+@@ -74,16 +82,14 @@ public:
+   explicit NxExp(tree::Stm *stm) : stm_(stm) {}
+ 
+   [[nodiscard]] tree::Exp *UnEx() const override {
+-    /* TODO: Put your lab5 code here */
+-
++    return new tree::EseqExp(stm_, new tree::ConstExp(0));
+   }
+   [[nodiscard]] tree::Stm *UnNx() const override { 
+-    /* TODO: Put your lab5 code here */
+-
++    return stm_;
+   }
+   [[nodiscard]] Cx UnCx(err::ErrorMsg *errormsg) const override {
+-    /* TODO: Put your lab5 code here */
+-
++    errormsg->Error(0, "cannot convert NxExp to Cx");
++    return Cx();
+   }
+ };
+ 
+@@ -95,39 +101,44 @@ public:
+       : cx_(trues, falses, stm) {}
+   
+   [[nodiscard]] tree::Exp *UnEx() const override {
+-    /* TODO: Put your lab5 code here */
+-
++    temp::Label *t = temp::LabelFactory::NewLabel();
++    temp::Label *f = temp::LabelFactory::NewLabel();
++    temp::Temp *r = temp::TempFactory::NewTemp();
++    cx_.trues_.DoPatch(t);
++    cx_.falses_.DoPatch(f);
++    tree::Stm *stm = new tree::SeqStm(
++      new tree::SeqStm(new tree::LabelStm(t),
++                       new tree::MoveStm(new tree::TempExp(r), new tree::ConstExp(1))),
++      new tree::SeqStm(new tree::LabelStm(f),
++                       new tree::MoveStm(new tree::TempExp(r), new tree::ConstExp(0))));
++    return new tree::EseqExp(stm, new tree::TempExp(r));
+   }
+   [[nodiscard]] tree::Stm *UnNx() const override {
+-    /* TODO: Put your lab5 code here */
+-
++    return cx_.stm_;
+   }
+   [[nodiscard]] Cx UnCx(err::ErrorMsg *errormsg) const override { 
+-    /* TODO: Put your lab5 code here */
+-
++    return cx_;
+   }
+ };
+ 
+ void ProgTr::Translate() {
+-  /* TODO: Put your lab5 code here */
+-
++  FillBaseTEnv();
++  FillBaseVEnv();
++  absyn_tree_->Translate(venv_.get(), tenv_.get(), main_level_.get(),
++                         temp::LabelFactory::NamedLabel("tigermain"),
++                         errormsg_.get());
+ }
+ 
+ } // namespace tr
+ 
+ namespace {
+ 
+-/**
+- * Wrapper for `ProcExitEntry1`, which deals with the return value of the
+- * function body
+- * @param level current level
+- * @param body function body
+- * @return statements after `ProcExitEntry1`
+- */
+ frame::ProcFrag *ProcEntryExit(tr::Level *level, tr::Exp *body) {
+-  /* TODO: Put your lab5 code here */
+-
++  tree::Stm *body_stm = body->UnNx();
++  tree::Stm *stm = frame::ProcEntryExit1(level->frame_, body_stm);
++  return new frame::ProcFrag(stm, level->frame_);
+ }
++
+ } // namespace
+ 
+ namespace absyn {
+@@ -135,179 +146,805 @@ namespace absyn {
+ tr::ExpAndTy *AbsynTree::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                    tr::Level *level, temp::Label *label,
+                                    err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  tr::ExpAndTy *result = root_->Translate(venv, tenv, level, label, errormsg);
++  frame::ProcFrag *frag = ProcEntryExit(level, result->exp_);
++  frags->PushBack(frag);
++  return result;
+ }
+ 
+ tr::ExpAndTy *SimpleVar::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                    tr::Level *level, temp::Label *label,
+                                    err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  env::EnvEntry *entry = venv->Look(sym_);
++  if (!entry) {
++    errormsg->Error(pos_, "undefined variable " + sym_->Name());
++    return new tr::ExpAndTy(new tr::ExExp(new tree::ConstExp(0)),
++                            type::IntTy::Instance());
++  }
++  env::VarEntry *var_entry = dynamic_cast<env::VarEntry *>(entry);
++  if (!var_entry) {
++    errormsg->Error(pos_, "undefined variable " + sym_->Name());
++    return new tr::ExpAndTy(new tr::ExExp(new tree::ConstExp(0)),
++                            type::IntTy::Instance());
++  }
++  tr::Access *access = var_entry->access_;
++  
++  // 静态链追溯：从当前 level 追溯到变量定义的 level
++  tree::Exp *curr_fp = new tree::TempExp(reg_manager->FramePointer());
++  tr::Level *var_level = access->level_;
++  while (level != var_level) {
++    if (level->parent_ == nullptr) break;
++    // 自定义函数（有 parent_）的第一个参数必然是静态链，不需要检查 empty()
++    curr_fp = level->Formals()->front()->access_->ToExp(curr_fp);
++    level = level->parent_;
++  }
++  
++  return new tr::ExpAndTy(new tr::ExExp(access->access_->ToExp(curr_fp)),
++                          var_entry->ty_);
+ }
+ 
+ tr::ExpAndTy *FieldVar::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                   tr::Level *level, temp::Label *label,
+                                   err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
++  tr::ExpAndTy *exp_ty = var_->Translate(venv, tenv, level, label, errormsg);
++  tr::Exp *exp = exp_ty->exp_;
++  type::Ty *ty = exp_ty->ty_->ActualTy();
++
++  if (typeid(*ty) != typeid(type::RecordTy)) {
++    errormsg->Error(pos_, "not a record type");
++    return new tr::ExpAndTy(new tr::ExExp(new tree::ConstExp(0)),
++                            type::VoidTy::Instance());
++  }
+ 
++  if (typeid(*exp) != typeid(tr::ExExp)) {
++    errormsg->Error(pos_, "field var's exp must be an expression");
++    return new tr::ExpAndTy(new tr::ExExp(new tree::ConstExp(0)),
++                            type::VoidTy::Instance());
++  }
++  auto record_ty = static_cast<type::RecordTy *>(ty);
++  type::FieldList *field_list = record_ty->fields_;
++  int order = 0;
++  for (auto field : field_list->GetList()) {
++    if (field->name_ == sym_) {
++      tree::Exp *texp = new tree::MemExp(new tree::BinopExp(
++          tree::PLUS_OP, exp->UnEx(),
++          new tree::ConstExp(order * reg_manager->WordSize())));
++      return new tr::ExpAndTy(new tr::ExExp(texp), field->ty_->ActualTy());
++    }
++    order++;
++  }
++  errormsg->Error(pos_, "field %s doesn't exist", sym_->Name().data());
++  return new tr::ExpAndTy(new tr::ExExp(new tree::ConstExp(0)),
++                          type::IntTy::Instance());
+ }
+ 
+ tr::ExpAndTy *SubscriptVar::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                       tr::Level *level, temp::Label *label,
+                                       err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  tr::ExpAndTy *var_exp_ty = var_->Translate(venv, tenv, level, label, errormsg);
++  tr::ExpAndTy *sub_exp_ty = subscript_->Translate(venv, tenv, level, label, errormsg);
++  
++  tree::Exp *var_exp = var_exp_ty->exp_->UnEx();
++  tree::Exp *sub_exp = sub_exp_ty->exp_->UnEx();
++  
++  tree::Exp *elem_exp = new tree::MemExp(new tree::BinopExp(
++      tree::PLUS_OP, var_exp,
++      new tree::BinopExp(tree::MUL_OP, sub_exp, new tree::ConstExp(reg_manager->WordSize()))));
++  
++  // 使用数组元素的真实类型，而不是硬编码为 IntTy
++  type::Ty *ty = var_exp_ty->ty_->ActualTy();
++  type::ArrayTy *array_ty = dynamic_cast<type::ArrayTy *>(ty);
++  if (!array_ty) {
++    errormsg->Error(pos_, "subscript on non-array type");
++    return new tr::ExpAndTy(new tr::ExExp(elem_exp), type::IntTy::Instance());
++  }
++  
++  return new tr::ExpAndTy(new tr::ExExp(elem_exp), array_ty->ty_->ActualTy());
+ }
+ 
+ tr::ExpAndTy *VarExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                 tr::Level *level, temp::Label *label,
+                                 err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  return var_->Translate(venv, tenv, level, label, errormsg);
+ }
+ 
+ tr::ExpAndTy *NilExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                 tr::Level *level, temp::Label *label,
+                                 err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  return new tr::ExpAndTy(new tr::ExExp(new tree::ConstExp(0)),
++                          type::NilTy::Instance());
+ }
+ 
+ tr::ExpAndTy *IntExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                 tr::Level *level, temp::Label *label,
+                                 err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  return new tr::ExpAndTy(new tr::ExExp(new tree::ConstExp(val_)),
++                          type::IntTy::Instance());
+ }
+ 
+ tr::ExpAndTy *StringExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                    tr::Level *level, temp::Label *label,
+                                    err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  temp::Label *str_label = temp::LabelFactory::NewLabel();
++  
++  // str_ 已经是 std::string 类型，直接使用即可
++  frags->PushBack(new frame::StringFrag(str_label, str_));
++  return new tr::ExpAndTy(new tr::ExExp(new tree::NameExp(str_label)),
++                          type::StringTy::Instance());
+ }
+ 
+ tr::ExpAndTy *CallExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                  tr::Level *level, temp::Label *label,
+                                  err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
++  env::EnvEntry *entry = venv->Look(func_);
++  if (!entry) {
++    errormsg->Error(pos_, "undefined function " + func_->Name());
++    return new tr::ExpAndTy(new tr::ExExp(new tree::ConstExp(0)),
++                            type::IntTy::Instance());
++  }
++  env::FunEntry *fun_entry = dynamic_cast<env::FunEntry *>(entry);
++  if (!fun_entry) {
++    errormsg->Error(pos_, "undefined function " + func_->Name());
++    return new tr::ExpAndTy(new tr::ExExp(new tree::ConstExp(0)),
++                            type::IntTy::Instance());
++  }
++  
++  tree::ExpList *args = new tree::ExpList();
++  for (Exp *arg : args_->GetList()) {
++    tr::ExpAndTy *arg_exp_ty = arg->Translate(venv, tenv, level, label, errormsg);
++    args->Append(arg_exp_ty->exp_->UnEx());
++  }
++  
++  // 情况一：如果是内置标准库函数（没有定义 level_）
++  if (fun_entry->level_ == nullptr) {
++    tree::Exp *call_exp = frame::ExternalCall(func_->Name(), args);
++    return new tr::ExpAndTy(new tr::ExExp(call_exp), fun_entry->result_);
++  }
+ 
+-  /* End for lab5 code */
++  // 情况二：如果是用户自定义函数（fun_entry->level_ != nullptr）
++  // 必须严格传入自定义函数的 label_，并正确传递静态链作为第一个参数
++  if (fun_entry->level_->parent_) {
++    tr::Level *parent_level = fun_entry->level_->parent_;
++    tree::Exp *static_link = new tree::TempExp(reg_manager->FramePointer());
++    tr::Level *curr_level = level;
++    
++    // 沿着静态链向上追溯，直到当前 level 匹配到被调函数的父 level
++    // 注意：即使 curr_level == parent_level（递归或同级调用），也需要继续追溯
++    // 因为被调函数需要的是其 parent_level 的 FP，而不是当前 level 的 FP
++    while (curr_level != parent_level && curr_level != nullptr) {
++      static_link = curr_level->Formals()->front()->access_->ToExp(static_link);
++      curr_level = curr_level->parent_;
++    }
++    
++    // 将计算出的静态链指针作为第一个参数插入到参数列表的最前面
++    args->Insert(static_link);
++  }
++  
++  // 生成标准的内部函数调用节点
++  tree::Exp *call_exp = new tree::CallExp(new tree::NameExp(fun_entry->label_), args);
++  return new tr::ExpAndTy(new tr::ExExp(call_exp), fun_entry->result_);
+ }
+ 
+ tr::ExpAndTy *OpExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                tr::Level *level, temp::Label *label,
+                                err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  tr::ExpAndTy *left_exp_ty = left_->Translate(venv, tenv, level, label, errormsg);
++  tr::ExpAndTy *right_exp_ty = right_->Translate(venv, tenv, level, label, errormsg);
++  
++  tree::Exp *left_exp = left_exp_ty->exp_->UnEx();
++  tree::Exp *right_exp = right_exp_ty->exp_->UnEx();
++  
++  // 处理关系运算符（返回 Cx 表达式）
++  if (oper_ == EQ_OP || oper_ == NEQ_OP || oper_ == LT_OP || 
++      oper_ == LE_OP || oper_ == GT_OP || oper_ == GE_OP) {
++    tree::RelOp relop;
++    switch (oper_) {
++      case EQ_OP: relop = tree::EQ_OP; break;
++      case NEQ_OP: relop = tree::NE_OP; break;
++      case LT_OP: relop = tree::LT_OP; break;
++      case LE_OP: relop = tree::LE_OP; break;
++      case GT_OP: relop = tree::GT_OP; break;
++      case GE_OP: relop = tree::GE_OP; break;
++      default: relop = tree::EQ_OP; break;
++    }
++    
++    // 创建 Cx 表达式（条件跳转）
++    temp::Label *t = temp::LabelFactory::NewLabel();
++    temp::Label *f = temp::LabelFactory::NewLabel();
++    tree::Stm *cjump = new tree::CjumpStm(relop, left_exp, right_exp, t, f);
++    tr::PatchList trues({&t});
++    tr::PatchList falses({&f});
++    return new tr::ExpAndTy(new tr::CxExp(trues, falses, cjump), type::IntTy::Instance());
++  }
++  
++  // 处理逻辑运算符 AND/OR（短路求值）
++  if (oper_ == AND_OP || oper_ == OR_OP) {
++    // A & B 相当于 if A then B else 0
++    // A | B 相当于 if A then 1 else B
++    temp::Label *true_label = temp::LabelFactory::NewLabel();
++    temp::Label *false_label = temp::LabelFactory::NewLabel();
++    temp::Label *end_label = temp::LabelFactory::NewLabel();
++    temp::Temp *result_temp = temp::TempFactory::NewTemp();
++    
++    Cx left_cx = left_exp_ty->exp_->UnCx(errormsg);
++    
++    tree::Stm *result_stm = nullptr;
++    if (oper_ == AND_OP) {
++      // A & B: if A then B else 0
++      left_cx.trues_.DoPatch(true_label);
++      left_cx.falses_.DoPatch(false_label);
++      
++      tr::ExpAndTy *right_exp_ty = right_->Translate(venv, tenv, level, label, errormsg);
++      tree::Stm *right_stm = new tree::MoveStm(new tree::TempExp(result_temp), right_exp_ty->exp_->UnEx());
++      
++      tree::Stm *true_stm = new tree::SeqStm(new tree::LabelStm(true_label), right_stm);
++      tree::Stm *false_stm = new tree::SeqStm(new tree::LabelStm(false_label),
++                                               new tree::MoveStm(new tree::TempExp(result_temp), new tree::ConstExp(0)));
++      tree::Stm *end_stm = new tree::LabelStm(end_label);
++      
++      result_stm = new tree::SeqStm(left_cx.stm_,
++                     new tree::SeqStm(true_stm,
++                     new tree::SeqStm(new tree::JumpStm(new tree::NameExp(end_label), 
++                                                        new std::vector<temp::Label *>{end_label}),
++                     new tree::SeqStm(false_stm, end_stm))));
++    } else {
++      // A | B: if A then 1 else B
++      left_cx.trues_.DoPatch(true_label);
++      left_cx.falses_.DoPatch(false_label);
++      
++      tree::Stm *true_stm = new tree::SeqStm(new tree::LabelStm(true_label),
++                                             new tree::MoveStm(new tree::TempExp(result_temp), new tree::ConstExp(1)));
++      
++      tr::ExpAndTy *right_exp_ty = right_->Translate(venv, tenv, level, label, errormsg);
++      tree::Stm *right_stm = new tree::MoveStm(new tree::TempExp(result_temp), right_exp_ty->exp_->UnEx());
++      tree::Stm *false_stm = new tree::SeqStm(new tree::LabelStm(false_label), right_stm);
++      tree::Stm *end_stm = new tree::LabelStm(end_label);
++      
++      result_stm = new tree::SeqStm(left_cx.stm_,
++                     new tree::SeqStm(true_stm,
++                     new tree::SeqStm(new tree::JumpStm(new tree::NameExp(end_label),
++                                                        new std::vector<temp::Label *>{end_label}),
++                     new tree::SeqStm(false_stm, end_stm))));
++    }
++    
++    return new tr::ExpAndTy(new tr::ExExp(new tree::EseqExp(result_stm, new tree::TempExp(result_temp))),
++                            type::IntTy::Instance());
++  }
++  
++  // 处理算术运算符
++  tree::BinOp binop;
++  switch (oper_) {
++    case PLUS_OP: binop = tree::PLUS_OP; break;
++    case MINUS_OP: binop = tree::MINUS_OP; break;
++    case TIMES_OP: binop = tree::MUL_OP; break;
++    case DIVIDE_OP: binop = tree::DIV_OP; break;
++    default: binop = tree::PLUS_OP; break;
++  }
++  
++  tree::Exp *result = new tree::BinopExp(binop, left_exp, right_exp);
++  return new tr::ExpAndTy(new tr::ExExp(result), type::IntTy::Instance());
+ }
+ 
+ tr::ExpAndTy *RecordExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                    tr::Level *level, temp::Label *label,      
+                                    err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  type::Ty *ty = tenv->Look(typ_);
++  if (!ty) {
++    errormsg->Error(pos_, "undefined type " + typ_->Name());
++    return new tr::ExpAndTy(new tr::ExExp(new tree::ConstExp(0)),
++                            type::VoidTy::Instance());
++  }
++  
++  type::RecordTy *record_ty = dynamic_cast<type::RecordTy *>(ty->ActualTy());
++  if (!record_ty) {
++    errormsg->Error(pos_, "not a record type");
++    return new tr::ExpAndTy(new tr::ExExp(new tree::ConstExp(0)),
++                            type::VoidTy::Instance());
++  }
++  
++  int field_count = record_ty->fields_->GetList().size();
++  temp::Temp *record_temp = temp::TempFactory::NewTemp();
++  
++  tree::ExpList *args = new tree::ExpList();
++  args->Append(new tree::ConstExp(field_count * reg_manager->WordSize()));
++  tree::Stm *alloc_stm = new tree::MoveStm(
++      new tree::TempExp(record_temp),
++      new tree::CallExp(new tree::NameExp(temp::LabelFactory::NamedLabel("allocRecord")),
++                        args));
++  
++  tree::Stm *init_stm = nullptr;
++  int order = 0;
++  for (EField *efield : fields_->GetList()) {
++    tr::ExpAndTy *field_exp_ty = efield->exp_->Translate(venv, tenv, level, label, errormsg);
++    tree::Exp *field_exp = field_exp_ty->exp_->UnEx();
++    
++    tree::Stm *move_stm = new tree::MoveStm(
++        new tree::MemExp(new tree::BinopExp(tree::PLUS_OP,
++                                            new tree::TempExp(record_temp),
++                                            new tree::ConstExp(order * reg_manager->WordSize()))),
++        field_exp);
++    
++    if (!init_stm) {
++      init_stm = move_stm;
++    } else {
++      init_stm = new tree::SeqStm(init_stm, move_stm);
++    }
++    order++;
++  }
++  
++  tree::Stm *all_stm = new tree::SeqStm(alloc_stm, init_stm);
++  return new tr::ExpAndTy(new tr::ExExp(new tree::EseqExp(all_stm, new tree::TempExp(record_temp))),
++                          ty);
+ }
+ 
+ tr::ExpAndTy *SeqExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                 tr::Level *level, temp::Label *label,
+                                 err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
++  std::list<Exp *> exp_list = seq_->GetList();
++  if (exp_list.empty()) {
++    return new tr::ExpAndTy(new tr::ExExp(new tree::ConstExp(0)),
++                            type::VoidTy::Instance());
++  }
++
++  tree::Stm *seq_stm = nullptr;
++  auto it = exp_list.begin();
++  
++  // 仅遍历到倒数第二个元素，作为有副作用的控制流语句
++  for (size_t i = 0; i < exp_list.size() - 1; ++i) {
++    tr::ExpAndTy *exp_ty = (*it)->Translate(venv, tenv, level, label, errormsg);
++    tree::Stm *exp_stm = exp_ty->exp_->UnNx();
++    if (!seq_stm) {
++      seq_stm = exp_stm;
++    } else {
++      seq_stm = new tree::SeqStm(seq_stm, exp_stm);
++    }
++    it++;
++  }
+ 
++  // 最后一个元素：只在这里翻译并充当返回值，避免双重求值
++  tr::ExpAndTy *last_exp_ty = (*it)->Translate(venv, tenv, level, label, errormsg);
++  if (seq_stm) {
++    return new tr::ExpAndTy(new tr::ExExp(new tree::EseqExp(seq_stm, last_exp_ty->exp_->UnEx())),
++                            last_exp_ty->ty_);
++  } else {
++    return last_exp_ty;
++  }
+ }
+ 
+ tr::ExpAndTy *AssignExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                    tr::Level *level, temp::Label *label,                       
+                                    err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  tr::ExpAndTy *var_exp_ty = var_->Translate(venv, tenv, level, label, errormsg);
++  tr::ExpAndTy *exp_exp_ty = exp_->Translate(venv, tenv, level, label, errormsg);
++  
++  tree::Exp *var_exp = var_exp_ty->exp_->UnEx();
++  tree::Exp *exp_exp = exp_exp_ty->exp_->UnEx();
++  
++  tree::Stm *assign_stm = new tree::MoveStm(var_exp, exp_exp);
++  return new tr::ExpAndTy(new tr::NxExp(assign_stm), type::VoidTy::Instance());
+ }
+ 
+ tr::ExpAndTy *IfExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                tr::Level *level, temp::Label *label,
+                                err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  tr::ExpAndTy *test_exp_ty = test_->Translate(venv, tenv, level, label, errormsg);
++  tr::ExpAndTy *then_exp_ty = then_->Translate(venv, tenv, level, label, errormsg);
++  
++  temp::Label *true_label = temp::LabelFactory::NewLabel();
++  temp::Label *false_label = temp::LabelFactory::NewLabel();
++  temp::Label *end_label = temp::LabelFactory::NewLabel();
++  
++  // 使用 Cx 处理条件表达式
++  Cx test_cx = test_exp_ty->exp_->UnCx(errormsg);
++  test_cx.trues_.DoPatch(true_label);
++  test_cx.falses_.DoPatch(false_label);
++  
++  tree::Stm *then_stm = then_exp_ty->exp_->UnNx();
++  tree::Stm *then_label_stm = new tree::LabelStm(true_label);
++  
++  tree::Stm *result_stm = nullptr;
++  type::Ty *result_ty = then_exp_ty->ty_;
++  
++  // 判断是否需要处理返回值
++  bool has_return_value = (typeid(*then_exp_ty->ty_) != typeid(type::VoidTy));
++  
++  if (elsee_) {
++    tr::ExpAndTy *else_exp_ty = elsee_->Translate(venv, tenv, level, label, errormsg);
++    tree::Stm *else_stm = else_exp_ty->exp_->UnNx();
++    tree::Stm *else_label_stm = new tree::LabelStm(false_label);
++    tree::Stm *end_label_stm = new tree::LabelStm(end_label);
++    
++    if (has_return_value) {
++      // 有返回值：需要分配临时寄存器存储结果
++      temp::Temp *r = temp::TempFactory::NewTemp();
++      
++      // 在 then 分支末尾添加赋值
++      tree::Stm *then_move = new tree::MoveStm(new tree::TempExp(r), then_exp_ty->exp_->UnEx());
++      tree::Stm *then_with_move = new tree::SeqStm(then_stm, then_move);
++      
++      // 在 else 分支末尾添加赋值
++      tree::Stm *else_move = new tree::MoveStm(new tree::TempExp(r), else_exp_ty->exp_->UnEx());
++      tree::Stm *else_with_move = new tree::SeqStm(else_stm, else_move);
++      
++      auto *jump_labels = new std::vector<temp::Label *>();
++      jump_labels->push_back(end_label);
++      tree::Stm *jump_stm = new tree::JumpStm(new tree::NameExp(end_label), jump_labels);
++      
++      result_stm = new tree::SeqStm(test_cx.stm_,
++                     new tree::SeqStm(then_label_stm,
++                     new tree::SeqStm(then_with_move,
++                     new tree::SeqStm(jump_stm,
++                     new tree::SeqStm(else_label_stm,
++                     new tree::SeqStm(else_with_move, end_label_stm))))));
++      result_ty = else_exp_ty->ty_;
++      
++      return new tr::ExpAndTy(new tr::ExExp(new tree::EseqExp(result_stm, new tree::TempExp(r))),
++                              result_ty);
++    } else {
++      // 无返回值（VoidTy）
++      auto *jump_labels = new std::vector<temp::Label *>();
++      jump_labels->push_back(end_label);
++      tree::Stm *jump_stm = new tree::JumpStm(new tree::NameExp(end_label), jump_labels);
++      
++      result_stm = new tree::SeqStm(test_cx.stm_,
++                     new tree::SeqStm(then_label_stm,
++                     new tree::SeqStm(then_stm,
++                     new tree::SeqStm(jump_stm,
++                     new tree::SeqStm(else_label_stm,
++                     new tree::SeqStm(else_stm, end_label_stm))))));
++      result_ty = else_exp_ty->ty_;
++    }
++  } else {
++    tree::Stm *else_label_stm = new tree::LabelStm(false_label);
++    
++    if (has_return_value) {
++      // 没有 else 分支但有返回值，这是语义错误，但我们在 IR 层处理
++      // 在 false 分支赋值 0 作为默认值
++      temp::Temp *r = temp::TempFactory::NewTemp();
++      tree::Stm *then_move = new tree::MoveStm(new tree::TempExp(r), then_exp_ty->exp_->UnEx());
++      tree::Stm *then_with_move = new tree::SeqStm(then_stm, then_move);
++      
++      // 在 false 分支也赋值 0，并确保有正确的跳转
++      tree::Stm *else_move = new tree::MoveStm(new tree::TempExp(r), new tree::ConstExp(0));
++      
++      auto *jump_labels = new std::vector<temp::Label *>();
++      jump_labels->push_back(end_label);
++      tree::Stm *jump_stm = new tree::JumpStm(new tree::NameExp(end_label), jump_labels);
++      
++      // then 分支执行后跳转到 end_label
++      tree::Stm *then_with_jump = new tree::SeqStm(then_with_move, jump_stm);
++      
++      // false 分支：标签 + 赋值
++      tree::Stm *else_block = new tree::SeqStm(else_label_stm, else_move);
++      
++      result_stm = new tree::SeqStm(test_cx.stm_,
++                     new tree::SeqStm(then_label_stm,
++                     new tree::SeqStm(then_with_jump, else_block)));
++      
++      // EseqExp 需要 (Stm*, Exp*)，使用 tree::TempExp(r) 作为返回值（r 已存储 then 分支或 0 的值）
++      return new tr::ExpAndTy(new tr::ExExp(new tree::EseqExp(result_stm, new tree::TempExp(r))),
++                              result_ty);
++    } else {
++      // 无 else 分支且无返回值（纯语句）
++      result_stm = new tree::SeqStm(test_cx.stm_,
++                     new tree::SeqStm(then_label_stm,
++                     new tree::SeqStm(then_stm, else_label_stm)));
++    }
++  }
++  
++  return new tr::ExpAndTy(new tr::NxExp(result_stm), result_ty);
+ }
+ 
+ tr::ExpAndTy *WhileExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                   tr::Level *level, temp::Label *label,            
+                                   err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  temp::Label *test_label = temp::LabelFactory::NewLabel();
++  temp::Label *body_label = temp::LabelFactory::NewLabel();
++  temp::Label *done_label = temp::LabelFactory::NewLabel();
++  
++  tr::ExpAndTy *test_exp_ty = test_->Translate(venv, tenv, level, label, errormsg);
++  
++  // 使用 Cx 处理条件表达式，避免冗余的 NE_OP 比较
++  Cx test_cx = test_exp_ty->exp_->UnCx(errormsg);
++  test_cx.trues_.DoPatch(body_label);
++  test_cx.falses_.DoPatch(done_label);
++  
++  // 将 done_label 压入循环栈
++  loop_stack.push_back(done_label);
++  
++  tr::ExpAndTy *body_exp_ty = body_->Translate(venv, tenv, level, label, errormsg);
++  tree::Stm *body_stm = body_exp_ty->exp_->UnNx();
++  
++  // 弹出循环栈
++  loop_stack.pop_back();
++  
++  tree::Stm *test_label_stm = new tree::LabelStm(test_label);
++  tree::Stm *body_label_stm = new tree::LabelStm(body_label);
++  
++  auto *jump_labels = new std::vector<temp::Label *>();
++  jump_labels->push_back(test_label);
++  tree::Stm *jump_back = new tree::JumpStm(new tree::NameExp(test_label), jump_labels);
++  tree::Stm *done_label_stm = new tree::LabelStm(done_label);
++  
++  tree::Stm *while_stm = new tree::SeqStm(test_label_stm,
++                            new tree::SeqStm(test_cx.stm_,
++                            new tree::SeqStm(body_label_stm,
++                            new tree::SeqStm(body_stm,
++                            new tree::SeqStm(jump_back, done_label_stm)))));
++  
++  return new tr::ExpAndTy(new tr::NxExp(while_stm), type::VoidTy::Instance());
+ }
+ 
+ tr::ExpAndTy *ForExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                 tr::Level *level, temp::Label *label,
+                                 err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+- 
++  tr::ExpAndTy *lo_exp_ty = lo_->Translate(venv, tenv, level, label, errormsg);
++  tr::ExpAndTy *hi_exp_ty = hi_->Translate(venv, tenv, level, label, errormsg);
++  
++  // 为 for 循环变量分配访问（不逃逸），并注册到 venv
++  tr::Access *i_access = tr::Access::AllocLocal(level, false);
++  tree::Exp *i_exp = i_access->access_->ToExp(
++      new tree::TempExp(reg_manager->FramePointer()));
++  venv->Enter(var_, new env::VarEntry(i_access, type::IntTy::Instance(), true));
++  
++  temp::Label *test_label = temp::LabelFactory::NewLabel();
++  temp::Label *body_label = temp::LabelFactory::NewLabel();
++  temp::Label *done_label = temp::LabelFactory::NewLabel();
++  
++  tree::Stm *init_stm = new tree::MoveStm(i_exp, lo_exp_ty->exp_->UnEx());
++  
++  tree::Exp *hi_exp = hi_exp_ty->exp_->UnEx();
++  tree::Stm *test_cjump = new tree::CjumpStm(tree::LE_OP, i_exp,
++                                             hi_exp, body_label, done_label);
++  
++  loop_stack.push_back(done_label);
++  
++  tree::Stm *body_stm = body_->Translate(venv, tenv, level, label, errormsg)->exp_->UnNx();
++  
++  loop_stack.pop_back();
++  
++  tree::Stm *test_label_stm = new tree::LabelStm(test_label);
++  tree::Stm *body_label_stm = new tree::LabelStm(body_label);
++  tree::Stm *inc_stm = new tree::MoveStm(i_exp,
++                                         new tree::BinopExp(tree::PLUS_OP,
++                                                            i_exp,
++                                                            new tree::ConstExp(1)));
++  
++  auto *jump_labels = new std::vector<temp::Label *>();
++  jump_labels->push_back(test_label);
++  tree::Stm *jump_back = new tree::JumpStm(new tree::NameExp(test_label), jump_labels);
++  tree::Stm *done_label_stm = new tree::LabelStm(done_label);
++  
++  tree::Stm *for_stm = new tree::SeqStm(init_stm,
++                           new tree::SeqStm(test_label_stm,
++                           new tree::SeqStm(test_cjump,
++                           new tree::SeqStm(body_label_stm,
++                           new tree::SeqStm(body_stm,
++                           new tree::SeqStm(inc_stm,
++                           new tree::SeqStm(jump_back, done_label_stm)))))));
++  
++  return new tr::ExpAndTy(new tr::NxExp(for_stm), type::VoidTy::Instance());
+ }
+ 
+ tr::ExpAndTy *BreakExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                   tr::Level *level, temp::Label *label,
+                                   err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  // 从循环栈中获取最近一层循环的 done_label
++  if (loop_stack.empty()) {
++    errormsg->Error(pos_, "break statement outside of loop");
++    return new tr::ExpAndTy(new tr::NxExp(new tree::ExpStm(new tree::ConstExp(0))),
++                            type::VoidTy::Instance());
++  }
++  temp::Label *done_label = loop_stack.back();
++  
++  auto *jump_labels = new std::vector<temp::Label *>();
++  jump_labels->push_back(done_label);
++  tree::Stm *break_stm = new tree::JumpStm(new tree::NameExp(done_label), jump_labels);
++  return new tr::ExpAndTy(new tr::NxExp(break_stm), type::VoidTy::Instance());
+ }
+ 
+ tr::ExpAndTy *LetExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                 tr::Level *level, temp::Label *label,
+                                 err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  venv->BeginScope();
++  tenv->BeginScope();
++  
++  tree::Stm *dec_stm = nullptr;
++  for (Dec *dec : decs_->GetList()) {
++    tr::Exp *dec_exp = dec->Translate(venv, tenv, level, label, errormsg);
++    tree::Stm *dec_translate = dec_exp->UnNx();
++    if (!dec_stm) {
++      dec_stm = dec_translate;
++    } else {
++      dec_stm = new tree::SeqStm(dec_stm, dec_translate);
++    }
++  }
++  
++  tr::ExpAndTy *body_exp_ty = body_->Translate(venv, tenv, level, label, errormsg);
++  
++  venv->EndScope();
++  tenv->EndScope();
++  
++  // 只有存在声明时才需要 EseqExp 包装，且 dec_stm 后面直接跟 body 的 UnEx()
++  if (dec_stm) {
++    return new tr::ExpAndTy(new tr::ExExp(new tree::EseqExp(dec_stm, body_exp_ty->exp_->UnEx())),
++                            body_exp_ty->ty_);
++  } else {
++    return body_exp_ty;
++  }
+ }
+ 
+ tr::ExpAndTy *ArrayExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                   tr::Level *level, temp::Label *label,                    
+                                   err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  type::Ty *ty = tenv->Look(typ_);
++  if (!ty) {
++    errormsg->Error(pos_, "undefined type " + typ_->Name());
++    return new tr::ExpAndTy(new tr::ExExp(new tree::ConstExp(0)),
++                            type::VoidTy::Instance());
++  }
++  
++  type::ArrayTy *array_ty = dynamic_cast<type::ArrayTy *>(ty->ActualTy());
++  if (!array_ty) {
++    errormsg->Error(pos_, "array type required");
++    return new tr::ExpAndTy(new tr::ExExp(new tree::ConstExp(0)),
++                            type::VoidTy::Instance());
++  }
++  
++  tr::ExpAndTy *size_exp_ty = size_->Translate(venv, tenv, level, label, errormsg);
++  tr::ExpAndTy *init_exp_ty = init_->Translate(venv, tenv, level, label, errormsg);
++  
++  tree::ExpList *args = new tree::ExpList();
++  args->Append(size_exp_ty->exp_->UnEx());
++  args->Append(init_exp_ty->exp_->UnEx());
++  
++  tree::Exp *array_exp = new tree::CallExp(
++      new tree::NameExp(temp::LabelFactory::NamedLabel("initArray")), args);
++  
++  return new tr::ExpAndTy(new tr::ExExp(array_exp), ty);
+ }
+ 
+ tr::ExpAndTy *VoidExp::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                  tr::Level *level, temp::Label *label,
+                                  err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  return new tr::ExpAndTy(new tr::ExExp(new tree::ConstExp(0)),
++                          type::VoidTy::Instance());
+ }
+ 
+ tr::Exp *FunctionDec::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                                 tr::Level *level, temp::Label *label,
+                                 err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  for (FunDec *fun_dec : functions_->GetList()) {
++    type::TyList *formals = fun_dec->params_->MakeFormalTyList(tenv, errormsg);
++    type::Ty *result = type::VoidTy::Instance();
++    if (fun_dec->result_) {
++      result = tenv->Look(fun_dec->result_);
++      if (!result) {
++        errormsg->Error(fun_dec->pos_, "undefined result type");
++        result = type::VoidTy::Instance();
++      }
++    }
++    
++    // 使用逃逸分析的结果，而不是全部写死为 true
++    std::list<bool> formal_escapes;
++    for (Field *field : fun_dec->params_->GetList()) {
++      formal_escapes.push_back(field->escape_);
++    }
++    
++    tr::Level *fun_level = tr::Level::NewLevel(level, temp::LabelFactory::NamedLabel(fun_dec->name_->Name()),
++                                                formal_escapes);
++    
++    temp::Label *fun_label = temp::LabelFactory::NamedLabel(fun_dec->name_->Name());
++    venv->Enter(fun_dec->name_, new env::FunEntry(fun_level, fun_label, formals, result));
++  }
++  
++  for (FunDec *fun_dec : functions_->GetList()) {
++    env::EnvEntry *entry = venv->Look(fun_dec->name_);
++    env::FunEntry *fun_entry = dynamic_cast<env::FunEntry *>(entry);
++    tr::Level *fun_level = fun_entry->level_;
++    
++    venv->BeginScope();
++    tenv->BeginScope();
++    
++    auto formal_acc_it = fun_level->Formals()->begin();
++    // 跳过第一个形式参数（静态链），它是专门留给静态链的
++    if (formal_acc_it != fun_level->Formals()->end()) {
++      formal_acc_it++;
++    }
++    
++    for (Field *field : fun_dec->params_->GetList()) {
++      type::Ty *ty = tenv->Look(field->typ_);
++      if (!ty) {
++        errormsg->Error(field->pos_, "undefined type");
++        ty = type::VoidTy::Instance();
++      }
++      tr::Access *access = *formal_acc_it++;
++      venv->Enter(field->name_, new env::VarEntry(access, ty));
++    }
++    
++    tr::ExpAndTy *body_exp_ty = fun_dec->body_->Translate(venv, tenv, fun_level, nullptr, errormsg);
++    frame::ProcFrag *frag = ProcEntryExit(fun_level, body_exp_ty->exp_);
++    frags->PushBack(frag);
++    
++    venv->EndScope();
++    tenv->EndScope();
++  }
++  
++  return new tr::NxExp(new tree::ExpStm(new tree::ConstExp(0)));
+ }
+ 
+ tr::Exp *VarDec::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                            tr::Level *level, temp::Label *label,
+                            err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
++  tr::ExpAndTy *init_exp_ty =
++      init_->Translate(venv, tenv, level, label, errormsg);
++  type::Ty *init_ty = init_exp_ty->ty_;
++
++  if (typ_) {
++    type::Ty *ty = tenv->Look(typ_);
++    if (!ty) {
++      errormsg->Error(pos_, "undefined type %s", typ_->Name().data());
++    }
++
++    if (!ty->IsSameType(init_ty)) {
++      errormsg->Error(pos_, "type and init type mismatch");
++    }
++  } else {
++    auto actual_init_ty = init_ty->ActualTy();
++    if (typeid(*actual_init_ty) == typeid(type::NilTy)) {
++      errormsg->Error(pos_, "init should not be nil without type specified");
++    }
++  }
++
++  tr::Access *access = tr::Access::AllocLocal(level, escape_);
++  venv->Enter(var_, new env::VarEntry(access, init_ty));
+ 
++  return new tr::NxExp(
++      new tree::MoveStm(access->access_->ToExp(new tree::TempExp(
++                            reg_manager->FramePointer())),
++                        init_exp_ty->exp_->UnEx()));
+ }
+ 
+ tr::Exp *TypeDec::Translate(env::VEnvPtr venv, env::TEnvPtr tenv,
+                             tr::Level *level, temp::Label *label,
+                             err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+- 
++  // 第一遍：为每个类型名创建 NameTy 占位符，支持递归类型
++  for (NameAndTy *nat : types_->GetList()) {
++    tenv->Enter(nat->name_, new type::NameTy(nat->name_, nullptr));
++  }
++  // 第二遍：解析实际类型
++  for (NameAndTy *nat : types_->GetList()) {
++    type::Ty *ty = nat->ty_->Translate(tenv, errormsg);
++    type::NameTy *name_ty = dynamic_cast<type::NameTy *>(tenv->Look(nat->name_));
++    if (name_ty) {
++      name_ty->ty_ = ty;
++    }
++  }
++  return new tr::NxExp(new tree::ExpStm(new tree::ConstExp(0)));
+ }
+ 
+ type::Ty *NameTy::Translate(env::TEnvPtr tenv, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  type::Ty *ty = tenv->Look(name_);
++  if (!ty) {
++    errormsg->Error(pos_, "undefined type " + name_->Name());
++    return type::VoidTy::Instance();
++  }
++  return ty;
+ }
+ 
+ type::Ty *RecordTy::Translate(env::TEnvPtr tenv,
+                               err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  type::FieldList *fields = record_->MakeFieldList(tenv, errormsg);
++  return new type::RecordTy(fields);
+ }
+ 
+ type::Ty *ArrayTy::Translate(env::TEnvPtr tenv, err::ErrorMsg *errormsg) const {
+-  /* TODO: Put your lab5 code here */
+-
++  type::Ty *ty = tenv->Look(array_);
++  if (!ty) {
++    errormsg->Error(pos_, "undefined type " + array_->Name());
++    return type::VoidTy::Instance();
++  }
++  return new type::ArrayTy(ty);
+ }
+ 
+ } // namespace absyn
+diff --git a/src/tiger/translate/translate.h b/src/tiger/translate/translate.h
+index e5fb1da..d36adea 100644
+--- a/src/tiger/translate/translate.h
++++ b/src/tiger/translate/translate.h
+@@ -18,7 +18,7 @@ class Level;
+ 
+ class PatchList {
+ public:
+-  void DoPatch(temp::Label *label) {
++  void DoPatch(temp::Label *label) const{
+     for(auto &patch : patch_list_) *patch = label;
+   }
+ 

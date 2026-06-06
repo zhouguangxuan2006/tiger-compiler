@@ -4,11 +4,11 @@
 #include <list>
 #include <memory>
 #include <string>
+#include <vector>
 
+#include "tiger/codegen/assem.h"
 #include "tiger/frame/temp.h"
 #include "tiger/translate/tree.h"
-#include "tiger/codegen/assem.h"
-
 
 namespace frame {
 
@@ -70,18 +70,31 @@ protected:
 
 class Access {
 public:
-  /* TODO: Put your lab5 code here */
-  
-  /* End for lab5 code */
-  
   virtual ~Access() = default;
-  
+  virtual tree::Exp *ToExp(tree::Exp *frame_ptr) const = 0;
 };
 
 class Frame {
-  /* TODO: Put your lab5 code here */
+public:
+  int word_size_;
+  int outgoing_size_;
+  temp::Label *name_;
+  std::list<frame::Access *> *formals_;
+  std::list<frame::Access *> *locals_;
+  int local_offset_;
 
-  /* End for lab5 code */
+  Frame(int word_size, int outgoing_size, temp::Label *name,
+        std::list<frame::Access *> *formals)
+      : word_size_(word_size), outgoing_size_(outgoing_size), name_(name),
+        formals_(formals), locals_(new std::list<frame::Access *>()),
+        local_offset_(0) {}
+
+  virtual ~Frame() = default;
+  virtual std::string GetLabel() const = 0;
+  virtual temp::Label *Name() const = 0;
+  virtual std::list<frame::Access *> *Formals() const = 0;
+  virtual frame::Access *AllocLocal(bool escape) = 0;
+  virtual void AllocOutgoSpace(int size) = 0;
 };
 
 /**
@@ -97,10 +110,6 @@ public:
     String,
   };
 
-  /**
-   *Generate assembly for main program
-   * @param out FILE object for output assembly file
-   */
   virtual void OutputAssem(FILE *out, OutputPhase phase, bool need_ra) const = 0;
 };
 
@@ -128,16 +137,15 @@ public:
 class Frags {
 public:
   Frags() = default;
-  void PushBack(Frag *frag) { frags_.emplace_back(frag); }
+  void PushBack(Frag *frag) { frags_.push_back(frag); }
   const std::list<Frag*> &GetList() { return frags_; }
 
 private:
   std::list<Frag*> frags_;
 };
 
-/* TODO: Put your lab5 code here */
-
-/* End for lab5 code */
+frame::Frame *NewFrame(temp::Label *name, std::list<bool> formals);
+assem::Proc *ProcEntryExit3(frame::Frame *frame, assem::InstrList *body);
 
 } // namespace frame
 

@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <list>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 #include "tiger/frame/temp.h"
