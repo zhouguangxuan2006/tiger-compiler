@@ -87,11 +87,11 @@ void ProcFrag::OutputAssem(FILE *out, OutputPhase phase, bool need_ra) const {
   }
 
   TigerLog("-------====Output assembly for %s=====-----\n",
-           frame_->frameLabel_->Name().data());
+           frame_->GetLabel().data());
 
-  assem::Proc *proc = frame::BuildCompleteProcedure(frame_, il);
+  assem::Proc *proc = frame::ProcEntryExit3(frame_, il);
 
-  std::string proc_name = frame_->GetFrameLabel();
+  std::string proc_name = frame_->GetLabel();
 
   fprintf(out, ".globl %s\n", proc_name.data());
   fprintf(out, ".type %s, @function\n", proc_name.data());

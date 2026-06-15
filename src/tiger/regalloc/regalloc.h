@@ -1,6 +1,8 @@
 #ifndef TIGER_REGALLOC_REGALLOC_H_
 #define TIGER_REGALLOC_REGALLOC_H_
 
+#include <map>
+
 #include "tiger/codegen/assem.h"
 #include "tiger/codegen/codegen.h"
 #include "tiger/frame/frame.h"
@@ -27,7 +29,24 @@ public:
 };
 
 class RegAllocator {
-  /* TODO: Put your lab6 code here */
+public:
+  RegAllocator(frame::Frame *frame, std::unique_ptr<cg::AssemInstr> assem_instr)
+      : frame_(frame), assem_instr_(std::move(assem_instr)),
+        il_(assem_instr_->GetInstrList()), coloring_(nullptr) {}
+
+  void RegAlloc();
+  std::unique_ptr<Result> BuildAllocationResult();
+
+private:
+  frame::Frame *frame_;
+  std::unique_ptr<cg::AssemInstr> assem_instr_;
+  assem::InstrList *il_;
+  temp::Map *coloring_;
+  std::map<temp::Temp *, int> spill_offsets_;
+
+  temp::TempList *AllocatableRegs();
+  void RewriteProgram(live::INodeListPtr spills);
+  std::string SpillAddress(temp::Temp *temp);
 };
 
 } // namespace ra

@@ -16,7 +16,19 @@ struct Result {
 };
 
 class Color {
-  /* TODO: Put your lab6 code here */
+public:
+  Color(live::LiveGraph live_graph, temp::Map *initial,
+        temp::TempList *registers)
+      : live_graph_(live_graph), initial_(initial), registers_(registers) {}
+
+  Result Coloring();
+
+private:
+  live::LiveGraph live_graph_;
+  temp::Map *initial_;
+  temp::TempList *registers_;
+
+  bool Precolored(live::INodePtr node) const;
 };
 } // namespace col
 

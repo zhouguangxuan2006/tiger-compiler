@@ -21,6 +21,8 @@ public:
   virtual ~Instr() = default;
 
   virtual void Print(FILE *out, temp::Map *m) const = 0;
+  virtual temp::TempList *Def() const = 0;
+  virtual temp::TempList *Use() const = 0;
 
 };
 
@@ -35,6 +37,8 @@ public:
       : assem_(std::move(assem)), dst_(dst), src_(src), jumps_(jumps) {}
 
   void Print(FILE *out, temp::Map *m) const override;
+  temp::TempList *Def() const override;
+  temp::TempList *Use() const override;
 
 };
 
@@ -47,6 +51,8 @@ public:
       : assem_(std::move(assem)), label_(label) {}
 
   void Print(FILE *out, temp::Map *m) const override;
+  temp::TempList *Def() const override;
+  temp::TempList *Use() const override;
 
 };
 
@@ -59,6 +65,8 @@ public:
       : assem_(std::move(assem)), dst_(dst), src_(src) {}
 
   void Print(FILE *out, temp::Map *m) const override;
+  temp::TempList *Def() const override;
+  temp::TempList *Use() const override;
 
 };
 

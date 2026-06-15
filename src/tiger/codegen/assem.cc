@@ -75,6 +75,13 @@ void LabelInstr::Print(FILE *out, temp::Map *m) const {
 }
 
 void MoveInstr::Print(FILE *out, temp::Map *m) const {
+  if (dst_ && src_ && dst_->GetList().size() == 1 &&
+      src_->GetList().size() == 1) {
+    std::string *dst = m->Look(dst_->NthTemp(0));
+    std::string *src = m->Look(src_->NthTemp(0));
+    if (dst && src && *dst == *src)
+      return;
+  }
   if (!dst_ && !src_) {
     std::size_t srcpos = assem_.find_first_of('%');
     if (srcpos != std::string::npos) {

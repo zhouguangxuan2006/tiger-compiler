@@ -8,138 +8,136 @@ void EscFinder::FindEscape() { absyn_tree_->Traverse(env_.get()); }
 namespace absyn {
 
 void AbsynTree::Traverse(esc::EscEnvPtr env) {
-  /* TODO: Put your lab5 code here */
-
-  /* End for lab5 code */
+  root_->Traverse(env, 0);
 }
 
 void SimpleVar::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-
-  /* End for lab5 code */
+  esc::EscapeEntry *entry = env->Look(sym_);
+  if (entry && entry->depth_ < depth) {
+    *entry->escape_ = true;
+  }
 }
 
 void FieldVar::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-
-  /* End for lab5 code */
+  var_->Traverse(env, depth);
 }
 
 void SubscriptVar::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-  
-  /* End for lab5 code */
+  var_->Traverse(env, depth);
+  subscript_->Traverse(env, depth);
 }
 
 void VarExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-  
-  /* End for lab5 code */
+  var_->Traverse(env, depth);
 }
 
 void NilExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-  /* End for lab5 code */
 }
 
 void IntExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-  /* End for lab5 code */
 }
 
 void StringExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-  /* End for lab5 code */
 }
 
 void CallExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-  if (!args_)
-    return;
-  for (Exp *arg : args_->GetList())
+  for (Exp *arg : args_->GetList()) {
     arg->Traverse(env, depth);
-  /* End for lab5 code */
+  }
 }
 
 void OpExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-
-  /* End for lab5 code */
+  left_->Traverse(env, depth);
+  right_->Traverse(env, depth);
 }
 
 void RecordExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-
-  /* End for lab5 code */
+  for (EField *efield : fields_->GetList()) {
+    efield->exp_->Traverse(env, depth);
+  }
 }
 
 void SeqExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-
-  /* End for lab5 code */
+  for (Exp *exp : seq_->GetList()) {
+    exp->Traverse(env, depth);
+  }
 }
 
 void AssignExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-
-  /* End for lab5 code */
+  var_->Traverse(env, depth);
+  exp_->Traverse(env, depth);
 }
 
 void IfExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-
-  /* End for lab5 code */
+  test_->Traverse(env, depth);
+  then_->Traverse(env, depth);
+  if (elsee_) {
+    elsee_->Traverse(env, depth);
+  }
 }
 
 void WhileExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-
-  /* End for lab5 code */
+  test_->Traverse(env, depth);
+  body_->Traverse(env, depth);
 }
 
 void ForExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-
-  /* End for lab5 code */
+  if (lo_) lo_->Traverse(env, depth);
+  if (hi_) hi_->Traverse(env, depth);
+  
+  env->BeginScope();
+  escape_ = false;
+  env->Enter(var_, new esc::EscapeEntry(depth, &escape_));
+  
+  if (body_) {
+    body_->Traverse(env, depth);
+  }
+  env->EndScope();
 }
 
 void BreakExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-  /* End for lab5 code */
 }
 
 void LetExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-
-  /* End for lab5 code */
+  env->BeginScope();
+  for (Dec *dec : decs_->GetList()) {
+    dec->Traverse(env, depth);
+  }
+  body_->Traverse(env, depth);
+  env->EndScope();
 }
 
 void ArrayExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-
-  /* End for lab5 code */
+  size_->Traverse(env, depth);
+  init_->Traverse(env, depth);
 }
 
 void VoidExp::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-  /* End for lab5 code */
 }
 
 void FunctionDec::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-
-  /* End for lab5 code */
+  for (FunDec *fun_dec : functions_->GetList()) {
+    env->BeginScope();
+    for (Field *field : fun_dec->params_->GetList()) {
+      field->escape_ = false;
+      env->Enter(field->name_, new esc::EscapeEntry(depth + 1, &field->escape_));
+    }
+    if (fun_dec->body_) {
+      fun_dec->body_->Traverse(env, depth + 1);
+    }
+    env->EndScope();
+  }
 }
 
 void VarDec::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-
-  /* End for lab5 code */
+  if (init_) {
+    init_->Traverse(env, depth);
+  }
+  escape_ = false;
+  env->Enter(var_, new esc::EscapeEntry(depth, &escape_));
 }
 
 void TypeDec::Traverse(esc::EscEnvPtr env, int depth) {
-  /* TODO: Put your lab5 code here */
-  /* End for lab5 code */
 }
 
 } // namespace absyn
